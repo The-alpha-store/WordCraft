@@ -1,4 +1,4 @@
-name: Android ARM64 build
+Name: Android ARM64 build
 
 on:
   workflow_dispatch:
@@ -48,6 +48,10 @@ jobs:
 
       - name: Check Cargo manifest structure
         run: cargo metadata --no-deps --format-version 1 --manifest-path rust/wordcraft_android_bridge/Cargo.toml > /tmp/wordcraft-cargo-metadata.json
+
+      # ADDED: This grants the runner permission to execute the Gradle wrapper
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
       - name: Build debug APK (includes ARM64 Rust library)
         run: ./gradlew --no-daemon :app:assembleDebug
