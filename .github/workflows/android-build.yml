@@ -19,25 +19,39 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - name: Install Android SDK and NDK
+
+      # CHANGED: v3 -> v4 (v4 fixes the removed "tools" package failure)
+      # Packages are declared explicitly so the action installs exactly
+      # what the build needs, without the obsolete "tools" package.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+
+      # CHANGED: platforms/build-tools are now installed by the action above,
+      # so this step only installs the NDK (and re-accepts licenses as a safety net).
+      - name: Install Android NDK
         run: |
           yes | sdkmanager --licenses
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          sdkmanager --install "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
       - name: Install Rust and Android target
         run: |
           rustup toolchain install 1.95.0 --profile minimal --target aarch64-linux-android
           rustup default 1.95.0
           cargo install cargo-ndk --version 4.1.2 --locked
+
       - name: Check Cargo manifest structure
         run: cargo metadata --no-deps --format-version 1 --manifest-path rust/wordcraft_android_bridge/Cargo.toml > /tmp/wordcraft-cargo-metadata.json
+
       - name: Build debug APK (includes ARM64 Rust library)
         run: ./gradlew --no-daemon :app:assembleDebug
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
