@@ -1,0 +1,7 @@
+Original source: https://github.com/storytold/wordcraft
+Release snapshot: wordcraft-0.16.0.zip (provided by the user in this conversation)
+Archive commit identifier (ZIP comment): 02a802cbafe45b5c8fecc00490c8f6b78c5ba251
+Uploaded archive SHA-256: a522418c557aacd3d12479dc3b66df378e22cdeb23432223fe85eb7e7b3d63a1
+Snapshot entry timestamps: 2026-11-06 19:32
+Vendored location: upstream/wordcraft/
+Integration rule: upstream/wordcraft is copied byte-for-byte from the supplied archive; Android-specific files live outside it.
