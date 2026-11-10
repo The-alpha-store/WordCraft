@@ -6,7 +6,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jint, jbyteArray, jstring};
+use jni::sys::{jboolean, jbyteArray, jfloat, jint, jstring};
 use jni::JNIEnv;
 use serde_json::{Value, json};
 use wordcraft_engine::{Session, doc::Document};
@@ -249,4 +249,161 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeCommandCata
     _class: JClass<'_>,
 ) -> jstring {
     java_string(&mut env, wordcraft_engine::catalog::CATALOG)
+}
+
+// ---------------------------------------------------------------------------
+// Page rendering, hit testing and caret geometry (all from the upstream engine)
+// ---------------------------------------------------------------------------
+
+/// Page and body-area sizes in points: `{"pages":[{"w","h","bx","by","bw","bh"}, ...]}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeLayoutInfo(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let layout = current.layout();
+            let pages: Vec<Value> = layout
+                .pages
+                .iter()
+                .map(|p| json!({"w": p.w, "h": p.h, "bx": p.body.x, "by": p.body.y, "bw": p.body.w, "bh": p.body.h}))
+                .collect();
+            json!({"ok": true, "pages": pages}).to_string()
+        }
+        Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Render one page with the engine's own rasteriser.
+/// Returns `[width: u32 LE][height: u32 LE][RGBA8 premultiplied pixels...]`, or null on failure.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeRenderPage(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    page: jint,
+    scale: jfloat,
+) -> jbyteArray {
+    let Ok(mut current) = session().lock() else { return std::ptr::null_mut() };
+    let layout = current.layout();
+    let Some(page_layout) = usize::try_from(page).ok().and_then(|i| layout.pages.get(i)) else {
+        return std::ptr::null_mut();
+    };
+    let opts = wordcraft_engine::render::RenderOptions::default();
+    let rendered = wordcraft_engine::render::render_page(&current.doc, page_layout, scale, &opts);
+    let mut out = Vec::with_capacity(8 + rendered.pixels.len());
+    out.extend_from_slice(&rendered.width.to_le_bytes());
+    out.extend_from_slice(&rendered.height.to_le_bytes());
+    out.extend_from_slice(&rendered.pixels);
+    env.byte_array_from_slice(&out).map(|array| array.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Move the caret (or extend the selection) to the document position under a page point
+/// (page coordinates in points). Returns `{"ok":true,"hit":bool}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeHitTest(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    page: jint,
+    x: jfloat,
+    y: jfloat,
+    extend: jboolean,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let layout = current.layout();
+            let story = current.sel.focus.story;
+            let hit = usize::try_from(page).ok().and_then(|i| layout.hit(i, x, y, story));
+            match hit {
+                Some(pos) => {
+                    let pos = current.doc.clamp(&pos);
+                    let anchor = if extend != 0 { current.sel.anchor.clone() } else { pos.clone() };
+                    let params = json!({"anchor": anchor, "focus": pos});
+                    json_result(current.run("select.range", &params).map(|_| json!({"hit": true})))
+                }
+                None => json!({"ok": true, "result": {"hit": false}}).to_string(),
+            }
+        }
+        Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Caret and selection geometry in page coordinates (points):
+/// `{"collapsed":bool,"focus":{page,x,top,height,width}|null,"anchor":{...}|null}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeCaretInfo(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let layout = current.layout();
+            let geometry = |pos: &wordcraft_engine::doc::Pos| {
+                layout.caret(pos).map(|c| json!({
+                    "page": c.page, "x": c.x, "top": c.top, "height": c.height, "width": c.width
+                }))
+            };
+            json!({
+                "ok": true,
+                "collapsed": current.sel.is_collapsed(),
+                "focus": geometry(&current.sel.focus),
+                "anchor": geometry(&current.sel.anchor),
+            })
+            .to_string()
+        }
+        Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Exercises the exact engine call sequence the JNI functions use (no JVM needed).
+    use super::*;
+
+    #[test]
+    fn type_hit_caret_render_roundtrip() {
+        let mut s = Session::new(Document::new());
+        s.run("text.insert", &json!({"text": "Hello Android"})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        s.run("format.bold", &json!({})).unwrap();
+
+        let layout = s.layout();
+        assert!(!layout.pages.is_empty(), "document must lay out at least one page");
+        let page = &layout.pages[0];
+        assert!(page.w > 100.0 && page.h > 100.0);
+
+        // Hit-test inside the first line of the body and move the caret there.
+        let (x, y) = (page.body.x + 20.0, page.body.y + 5.0);
+        let pos = layout.hit(0, x, y, s.sel.focus.story).expect("hit inside first line");
+        let pos = s.doc.clamp(&pos);
+        let params = json!({"anchor": pos, "focus": pos});
+        s.run("select.range", &params).unwrap();
+        assert!(s.sel.is_collapsed());
+
+        let layout = s.layout();
+        let caret = layout.caret(&s.sel.focus).expect("caret geometry");
+        assert_eq!(caret.page, 0);
+        assert!(caret.height > 0.0);
+
+        // Typing at the caret changes the text; rendering produces ink, not a blank page.
+        s.run("text.insert", &json!({"text": "X"})).unwrap();
+        assert!(s.doc.plain_text(wordcraft_engine::doc::StoryRef::Body).contains('X'));
+        let layout = s.layout();
+        let opts = wordcraft_engine::render::RenderOptions::default();
+        let img = wordcraft_engine::render::render_page(&s.doc, &layout.pages[0], 1.0, &opts);
+        assert_eq!(img.pixels.len(), (img.width * img.height * 4) as usize);
+        let dark = img.pixels.chunks(4).filter(|p| p[0] < 128 && p[1] < 128 && p[2] < 128).count();
+        assert!(dark > 20, "expected rendered glyph pixels, found {dark}");
+
+        // Undo and a table insert go through the same command registry.
+        s.run("edit.undo", &json!({})).unwrap();
+        s.run("insert.table", &json!({"rows": 2, "cols": 2})).unwrap();
+        s.run("table.insertRowBelow", &json!({})).unwrap();
+        // A tiny picture (1x1 PNG) through insert.picture with base64 data.
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+        s.run("insert.picture", &json!({"data": png, "width": 120})).unwrap();
+    }
 }

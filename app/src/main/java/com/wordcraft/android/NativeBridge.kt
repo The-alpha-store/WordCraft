@@ -19,4 +19,16 @@ object NativeBridge {
     external fun nativeSaveDocument(name: String): ByteArray?
     external fun nativeGetLayoutSummary(): String
     external fun nativeCommandCatalog(): String
+
+    /** Page/body sizes in points (JSON). */
+    external fun nativeLayoutInfo(): String
+
+    /** `[w:u32 LE][h:u32 LE][RGBA8 premultiplied pixels]` rendered by the engine, or null. */
+    external fun nativeRenderPage(page: Int, scale: Float): ByteArray?
+
+    /** Move caret / extend selection to the page point (points). JSON result. */
+    external fun nativeHitTest(page: Int, x: Float, y: Float, extend: Boolean): String
+
+    /** Caret + selection geometry in page coordinates (JSON). */
+    external fun nativeCaretInfo(): String
 }

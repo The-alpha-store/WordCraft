@@ -1,28 +1,38 @@
 # Build and verification status
 
-Date: 2026-11-09
+Date: 2026-11-10
 
-## Completed in source tree
+## Verified (host x86_64 Linux, Rust 1.99.1)
 
-- [x] Extracted the user-provided WordCraft 0.16.0 archive.
-- [x] Recorded its archive commit identifier and SHA-256.
-- [x] Copied all 1,058 upstream files into `upstream/wordcraft/`.
-- [x] Compared extracted upstream tree with vendored tree; no file differences were found.
-- [x] Added Android Compose shell and JNI adapter.
-- [x] Added command-id/JSON-parameter dispatch to the original engine `Session`.
-- [x] Added filename-extension-based engine open/save calls.
-- [x] Added a generic Save As path through the engine export dispatcher.
-- [x] Prevented ordinary open/save from replacing an unchanged rich document with the plain-text editor buffer.
-- [x] Added Gradle bootstrap, Android ARM64 configuration and GitHub Actions workflow.
-- [x] Checked ZIP archive structure and project file inventory.
+- [x] JNI bridge (`rust/wordcraft_android_bridge`) compiles against the vendored WordCraft 0.16.0 engine (`cargo check`).
+- [x] `cargo test --lib` passes: types text, applies bold, hit-tests a page point into a caret, reads caret
+      geometry, renders a page with the engine rasteriser (checks glyph pixels exist), undo, inserts a table and
+      a row, and inserts a base64 picture. This is the same engine call sequence the new JNI functions use.
+- [x] Android-target dependency tree resolves with no fontconfig/GPU/windowing crates (`cargo tree --target aarch64-linux-android`).
+
+## Fixed in this revision
+
+- Bridge was missing upstream's `[patch.crates-io] krilla = ...` (craft-pdf needs that fork), so the bridge
+  failed to compile. Patch, release profile and upstream `Cargo.lock` are now in the bridge crate.
+
+## New in this revision (written, NOT yet compiled or run on Android)
+
+- Rust: `nativeLayoutInfo`, `nativeRenderPage`, `nativeHitTest`, `nativeCaretInfo`.
+- Kotlin: `EditorState.kt`, `DocumentCanvas.kt` (engine-rendered pages in a scrolling, pinch-zoomable canvas,
+  tap to place caret, long-press-drag to select, caret/selection overlay, hidden-field keyboard input),
+  new `MainActivity.kt` (formatting, clipboard, picture picker, table tools, open/save/PDF).
+- The old whole-body `document.setText` text field is gone.
 
 ## Not yet verified
 
-- [ ] Rust bridge compiles for `aarch64-linux-android`.
-- [ ] Gradle Kotlin/Android compilation succeeds.
-- [ ] Debug APK is produced.
-- [ ] APK installs and launches on the user's physical phone.
-- [ ] DOCX round-trip and PDF export pass real-device tests.
-- [ ] Rich text, pagination rendering and native IME integration work end-to-end.
+- [ ] `aarch64-linux-android` cross-compile (needs NDK; first CI run).
+- [ ] Gradle/Kotlin/Compose compilation.
+- [ ] APK installs and runs on a phone; touch/zoom/keyboard behaviour.
 
-The current execution environment has Java but does not have `rustc`, `cargo`, `gradle`, Android SDK or Android NDK installed. Therefore no successful build or APK is claimed. The supplied GitHub Actions workflow is the reproducible build path, but it still needs its first run.
+## Known limitations
+
+- Keyboard input is committed-text only (no composing region / surrounding-text IME protocol, no predictive text).
+- Selection highlight is approximate (built from caret geometry); no draggable selection handles yet.
+- Table tools are menu buttons acting at the caret; no cell hit-testing/row-column handles on canvas yet.
+- Pictures are inserted inline at 300 pt wide; no resize/move handles yet.
+- Whole pages are re-rendered after each edit (fine for short documents; needs profiling on large ones).
