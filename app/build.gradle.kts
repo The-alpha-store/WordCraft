@@ -41,13 +41,13 @@ dependencies {
 }
 
 // Compile the Rust JNI bridge (against the vendored WordCraft engine) before the app builds.
+// cargo-ndk looks for Cargo.toml in its working directory, so run it inside the bridge crate.
 val buildWordCraftRust by tasks.registering(Exec::class) {
-    workingDir(rootProject.projectDir)
+    workingDir(rootProject.file("rust/wordcraft_android_bridge"))
     commandLine(
         "cargo", "ndk", "-t", "arm64-v8a",
-        "-o", "app/src/main/jniLibs",
-        "build", "--release",
-        "--manifest-path", "rust/wordcraft_android_bridge/Cargo.toml"
+        "-o", rootProject.file("app/src/main/jniLibs").absolutePath,
+        "build", "--release"
     )
 }
 
