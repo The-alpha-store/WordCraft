@@ -30,11 +30,33 @@ class EditorState {
     var anchor by mutableStateOf<CaretGeo?>(null); private set
     var collapsed by mutableStateOf(true); private set
 
+    /** Commands the engine currently reports as disabled, with its reason. */
+    var disabled by mutableStateOf<Map<String, String>>(emptyMap()); private set
+
     /** Bumped after every engine change; page bitmaps are re-rendered when it changes. */
     var revision by mutableIntStateOf(0); private set
     var zoom by mutableFloatStateOf(1f)
     var status by mutableStateOf("")
+
+    /** First page currently visible in the scrolling canvas (0-based), for the status bar. */
+    var visiblePage by mutableIntStateOf(0)
     var dirty by mutableStateOf(false)
+
+    /** Set to ask the canvas to scroll to a page position; [nonce] makes repeats distinct. */
+    data class ScrollTarget(val page: Int, val yPoints: Float, val nonce: Long)
+    var scrollTarget by mutableStateOf<ScrollTarget?>(null)
+    private var scrollNonce = 0L
+
+    fun scrollTo(page: Int, yPoints: Float = 0f) {
+        scrollTarget = ScrollTarget(page, yPoints, ++scrollNonce)
+    }
+
+    /** Move the caret to a position described by the engine (a Pos as JSON) and scroll to it. */
+    suspend fun goTo(posJson: String) {
+        val pos = JSONObject(posJson)
+        val ok = command("select.range", JSONObject().put("anchor", pos).put("focus", pos).toString(), edits = false)
+        if (ok) focus?.let { scrollTo(it.page, (it.top - 40f).coerceAtLeast(0f)) }
+    }
 
     private val gate = Mutex()
 
@@ -55,8 +77,13 @@ class EditorState {
         fun geo(key: String): CaretGeo? = caret.optJSONObject(key)?.let {
             CaretGeo(it.getInt("page"), it.getDouble("x").toFloat(), it.getDouble("top").toFloat(), it.getDouble("height").toFloat())
         }
-        Triple(list, geo("focus") to geo("anchor"), caret.optBoolean("collapsed", true))
-    }.let { (list, carets, isCollapsed) ->
+        val off = JSONObject(NativeBridge.nativeDisabledCommands())
+        val offMap = HashMap<String, String>()
+        off.keys().forEach { k -> offMap[k] = off.optString(k) }
+        Pair(Triple(list, geo("focus") to geo("anchor"), caret.optBoolean("collapsed", true)), offMap as Map<String, String>)
+    }.let { (triple, offMap) ->
+        val (list, carets, isCollapsed) = triple
+        disabled = offMap
         pages = list
         focus = carets.first
         anchor = carets.second
@@ -72,6 +99,13 @@ class EditorState {
         val ok = runCatching { JSONObject(raw).optBoolean("ok") }.getOrDefault(false)
         if (!ok) {
             status = runCatching { JSONObject(raw).optString("error", "Command failed") }.getOrDefault(raw)
+        } else {
+            // Some commands return information (word count, search hits...): show it.
+            val shown = runCatching {
+                val r = JSONObject(raw).opt("result")
+                if (r == null || r == JSONObject.NULL) "" else r.toString()
+            }.getOrDefault("")
+            status = if (shown.length > 2 && shown != "{}" && shown != "[]") shown.take(400) else ""
         }
         if (ok && edits) dirty = true
         refreshLocked()

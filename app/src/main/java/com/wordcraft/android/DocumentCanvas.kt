@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -69,8 +70,12 @@ fun DocumentCanvas(state: EditorState, modifier: Modifier = Modifier) {
     val keyboard = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     val hScroll = rememberScrollState()
+    val listState = rememberLazyListState()
 
     LaunchedEffect(Unit) { state.refresh() }
+    LaunchedEffect(listState) {
+        androidx.compose.runtime.snapshotFlow { listState.firstVisibleItemIndex }.collect { state.visiblePage = it }
+    }
 
     BoxWithConstraints(
         modifier
@@ -101,8 +106,15 @@ fun DocumentCanvas(state: EditorState, modifier: Modifier = Modifier) {
         val contentWidthDp = with(density) { max(viewportPx, widestPx + 2 * marginPx).toDp() }
 
         Box(Modifier.fillMaxSize().horizontalScroll(hScroll)) {
+            LaunchedEffect(state.scrollTarget) {
+                state.scrollTarget?.let { t ->
+                    val index = t.page.coerceIn(0, (state.pages.size - 1).coerceAtLeast(0))
+                    listState.animateScrollToItem(index, (t.yPoints * pxPerPoint).toInt())
+                }
+            }
             LazyColumn(
-                Modifier.width(contentWidthDp),
+                state = listState,
+                modifier = Modifier.width(contentWidthDp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 12.dp)

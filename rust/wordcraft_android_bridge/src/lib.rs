@@ -358,6 +358,107 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeCaretInfo(
     java_string(&mut env, text)
 }
 
+// ---------------------------------------------------------------------------
+// Ribbon model: the engine's own command catalog joined with its command registry
+// ---------------------------------------------------------------------------
+
+/// Every ribbon entry of the desktop app (tab, group, label, command id) with the command's
+/// parameter description and shortcut, and whether this build implements it:
+/// `{"ok":true,"items":[{"tab","group","label","id","exists","params","shortcut"}]}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeRibbon(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(current) => {
+            let items: Vec<Value> = wordcraft_engine::catalog::entries()
+                .into_iter()
+                .map(|(tab, group, label, id)| {
+                    let spec = current.registry.get(id);
+                    json!({
+                        "tab": tab, "group": group, "label": label, "id": id,
+                        "exists": spec.is_some(),
+                        "params": spec.map(|s| s.params).unwrap_or("{}"),
+                        "shortcut": spec.map(|s| s.shortcut).unwrap_or(""),
+                    })
+                })
+                .collect();
+            json!({"ok": true, "items": items}).to_string()
+        }
+        Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// All registered commands (id, label, location, shortcut, params, mutates) as a JSON array,
+/// for the command search palette.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeCommandRegistry(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(current) => current.registry.describe().to_string(),
+        Err(_) => "[]".to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Commands that are currently disabled, with the engine's reason: `{"id":"reason", ...}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeDisabledCommands(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(current) => {
+            let session: &Session = &current;
+            let mut disabled = serde_json::Map::new();
+            for spec in session.registry.all() {
+                if let Some(reason) = (spec.enabled)(session) {
+                    disabled.insert(spec.id.to_string(), json!(reason));
+                }
+            }
+            Value::Object(disabled).to_string()
+        }
+        Err(_) => "{}".to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Headings of the body for the navigation pane:
+/// `{"ok":true,"headings":[{"level":1,"text":"...","pos":<Pos>}]}`; `pos` can be passed to
+/// `select.range` (as both anchor and focus) to jump there.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeHeadings(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    use wordcraft_engine::doc::{Pos, StoryRef};
+    let text = match session().lock() {
+        Ok(current) => {
+            let doc = &current.doc;
+            let mut items: Vec<Value> = Vec::new();
+            for path in doc.para_paths(StoryRef::Body) {
+                let Some(p) = doc.para(StoryRef::Body, &path) else { continue };
+                let rp = doc.styles.resolve_para(&p.props);
+                if let Some(level) = rp.outline_level {
+                    let txt = p.plain_text().trim().to_string();
+                    if txt.is_empty() || rp.style.starts_with("TOC") {
+                        continue;
+                    }
+                    let pos = Pos::new(StoryRef::Body, path.clone(), 0);
+                    items.push(json!({"level": level, "text": txt, "pos": pos}));
+                }
+            }
+            json!({"ok": true, "headings": items}).to_string()
+        }
+        Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
 #[cfg(test)]
 mod tests {
     //! Exercises the exact engine call sequence the JNI functions use (no JVM needed).
@@ -405,5 +506,39 @@ mod tests {
         // A tiny picture (1x1 PNG) through insert.picture with base64 data.
         let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
         s.run("insert.picture", &json!({"data": png, "width": 120})).unwrap();
+    }
+
+    #[test]
+    fn ribbon_catalog_joins_registry() {
+        let s = Session::new(Document::new());
+        let entries = wordcraft_engine::catalog::entries();
+        let live = entries.iter().filter(|(_, _, _, id)| s.registry.get(id).is_some()).count();
+        assert!(entries.len() > 400, "catalog has {} entries", entries.len());
+        assert!(live * 100 / entries.len() >= 90, "only {live}/{} catalog entries are implemented", entries.len());
+        let disabled = s.registry.all().iter().filter(|c| (c.enabled)(&s).is_some()).count();
+        assert!(disabled < s.registry.all().len());
+        eprintln!("ribbon: {} entries, {} implemented, {} disabled in a blank doc", entries.len(), live, disabled);
+    }
+
+    #[test]
+    fn headings_for_navigation_pane() {
+        use wordcraft_engine::doc::StoryRef;
+        let mut s = Session::new(Document::new());
+        s.run("text.insert", &json!({"text": "Intro"})).unwrap();
+        s.run("para.heading1", &json!({})).unwrap();
+        s.run("text.newParagraph", &json!({})).unwrap();
+        s.run("para.normal", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": "Body text"})).unwrap();
+        let doc = &s.doc;
+        let mut found = Vec::new();
+        for path in doc.para_paths(StoryRef::Body) {
+            let p = doc.para(StoryRef::Body, &path).unwrap();
+            let rp = doc.styles.resolve_para(&p.props);
+            if let Some(level) = rp.outline_level {
+                found.push((level, p.plain_text()));
+            }
+        }
+        assert_eq!(found.len(), 1, "exactly the Heading 1 paragraph: {found:?}");
+        assert_eq!(found[0].1.trim(), "Intro");
     }
 }
