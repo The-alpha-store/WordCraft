@@ -40,7 +40,10 @@ jobs:
       - name: Check Cargo manifest structure
         run: cargo metadata --no-deps --format-version 1 --manifest-path rust/wordcraft_android_bridge/Cargo.toml > /tmp/wordcraft-cargo-metadata.json
       - name: Build debug APK (includes ARM64 Rust library)
-        run: ./gradlew --no-daemon :app:assembleDebug
+        # gradlew loses its executable bit when uploaded from a phone or unzipped, so set it here.
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleDebug
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
