@@ -62,6 +62,7 @@ import androidx.compose.material.icons.filled.Superscript
 import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material.icons.filled.Title
 import androidx.compose.material.icons.filled.Undo
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -416,9 +417,16 @@ fun StylesPanelContent(onRun: (String, String) -> Unit) {
 
 /** Font size, colour and highlight at one tap. */
 @Composable
-fun FormatPanelContent(onRun: (String, String) -> Unit) {
+fun FormatPanelContent(onPickFont: () -> Unit, onRun: (String, String) -> Unit) {
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-        Text("Font size", fontSize = 12.sp, color = Color(0xFF616161))
+        Text("Font", fontSize = 12.sp, color = Color(0xFF616161))
+        Row(Modifier.horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onPickFont) { Text("All fonts…") }
+            listOf("Times New Roman", "Arial", "Courier New").forEach { f ->
+                TextButton(onClick = { onRun("format.font", "{\"name\":\"$f\"}") }) { Text(f) }
+            }
+        }
+        Text("Font size", Modifier.padding(top = 4.dp), fontSize = 12.sp, color = Color(0xFF616161))
         Row(Modifier.horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = { onRun("format.shrinkFont", "{}") }) { Text("A−") }
             TextButton(onClick = { onRun("format.growFont", "{}") }) { Text("A+") }
@@ -447,4 +455,49 @@ private fun Swatches(hex: List<String>, onPick: (String) -> Unit) {
             )
         }
     }
+}
+
+
+private val PINNED_FONTS = listOf("Times New Roman", "Arial", "Courier New", "Calibri", "Cambria", "Georgia", "Verdana", "Aptos")
+
+private fun fontHint(name: String, installed: Set<String>): String? {
+    if (name.lowercase() in installed) return null
+    return when (name) {
+        "Times New Roman" -> "Drawn with Liberation Serif (same widths as Times New Roman)"
+        "Arial" -> "Drawn with Liberation Sans (same widths as Arial)"
+        "Courier New" -> "Drawn with Liberation Mono (same widths as Courier New)"
+        else -> "Not installed here: a similar font is shown, the name stays in the file"
+    }
+}
+
+/** Font list: the usual Word fonts first (Times New Roman on top), then everything installed. */
+@Composable
+fun FontPickerDialog(onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    var query by remember { mutableStateOf("") }
+    val installed = remember { FontSetup.families() }
+    val installedLower = remember(installed) { installed.map { it.lowercase() }.toSet() }
+    val all = remember(installed) { (PINNED_FONTS + installed).distinctBy { it.lowercase() } }
+    val shown = all.filter { query.isBlank() || it.contains(query.trim(), ignoreCase = true) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Font") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = query, onValueChange = { query = it }, singleLine = true,
+                    label = { Text("Search fonts") }, modifier = Modifier.fillMaxWidth()
+                )
+                LazyColumn(Modifier.height(380.dp)) {
+                    items(shown) { name ->
+                        Column(Modifier.fillMaxWidth().clickable { onPick(name) }.padding(vertical = 9.dp)) {
+                            Text(name, fontSize = 16.sp)
+                            fontHint(name, installedLower)?.let { Text(it, fontSize = 11.sp, color = Color(0xFF667085)) }
+                        }
+                        HorizontalDivider(color = Color(0xFFEEEEEE))
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+    )
 }

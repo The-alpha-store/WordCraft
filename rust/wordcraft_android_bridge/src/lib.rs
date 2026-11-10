@@ -541,4 +541,52 @@ mod tests {
         assert_eq!(found.len(), 1, "exactly the Heading 1 paragraph: {found:?}");
         assert_eq!(found[0].1.trim(), "Intro");
     }
+
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len() * 4 / 3 + 4);
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    /// The app ships Liberation Serif (metric-compatible with Times New Roman) in its assets and
+    /// registers it at start-up with `font.add`. Text set in "Times New Roman" must then be drawn
+    /// with it (same line breaks as Word), and the font must be selectable as "Times New Roman".
+    #[test]
+    fn times_new_roman_resolves_to_bundled_liberation_serif() {
+        let mut s = Session::new(Document::new());
+        let fonts: [(&str, &[u8]); 4] = [
+            ("LiberationSerif-Regular.ttf", include_bytes!("../../../app/src/main/assets/fonts/LiberationSerif-Regular.ttf")),
+            ("LiberationSerif-Bold.ttf", include_bytes!("../../../app/src/main/assets/fonts/LiberationSerif-Bold.ttf")),
+            ("LiberationSerif-Italic.ttf", include_bytes!("../../../app/src/main/assets/fonts/LiberationSerif-Italic.ttf")),
+            ("LiberationSerif-BoldItalic.ttf", include_bytes!("../../../app/src/main/assets/fonts/LiberationSerif-BoldItalic.ttf")),
+        ];
+        for (name, bytes) in fonts {
+            s.run("font.add", &json!({"data": b64(bytes), "name": name})).unwrap();
+        }
+        let listed = s.run("font.list", &json!({"all": true})).unwrap();
+        let families = listed["families"].as_array().unwrap();
+        assert!(families.iter().any(|f| f == "Liberation Serif"), "Liberation Serif registered: {families:?}");
+
+        s.run("text.insert", &json!({"text": "The quick brown fox"})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        s.run("format.font", &json!({"name": "Times New Roman"})).unwrap();
+        let missing = s.run("font.missing", &json!({})).unwrap();
+        eprintln!("font.missing = {missing}");
+        let entry = missing["missing"].as_array().unwrap().iter().find(|m| m["font"] == "Times New Roman").expect("TNR reported as substituted");
+        assert!(entry["shownAs"].as_array().unwrap().iter().any(|f| f == "Liberation Serif"), "drawn in Liberation Serif: {entry}");
+        assert_eq!(entry["metricCompatible"], json!(true));
+
+        let layout = s.layout();
+        let opts = wordcraft_engine::render::RenderOptions::default();
+        let img = wordcraft_engine::render::render_page(&s.doc, &layout.pages[0], 1.0, &opts);
+        let dark = img.pixels.chunks(4).filter(|p| p[0] < 128).count();
+        assert!(dark > 50, "text rendered ({dark} dark px)");
+    }
 }

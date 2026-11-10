@@ -38,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -144,6 +145,13 @@ private fun WordCraftApp() {
     var showNav by remember { mutableStateOf(false) }
     var showStyles by remember { mutableStateOf(false) }
     var showFormat by remember { mutableStateOf(false) }
+    var showFontPicker by remember { mutableStateOf(false) }
+
+    // Register the bundled Liberation fonts (Times New Roman / Arial / Courier New metrics) once.
+    LaunchedEffect(Unit) {
+        FontSetup.registerBundled(context)
+        state.refresh()
+    }
 
     // Platform-specific commands are handled here; everything else runs in the engine.
     fun invoke(item: RibbonItem) {
@@ -156,6 +164,7 @@ private fun WordCraftApp() {
             "view.zoomIn" -> state.zoom = (state.zoom * 1.2f).coerceAtMost(2.5f)
             "view.zoomOut" -> state.zoom = (state.zoom / 1.2f).coerceAtLeast(0.6f)
             "view.pageWidth", "view.onePage", "view.multiplePages" -> state.zoom = 1f
+            "format.font" -> showFontPicker = true
             "view.navigationPane" -> showNav = !showNav
             "styles.pane" -> showStyles = !showStyles
             "file.new" -> {
@@ -182,6 +191,21 @@ private fun WordCraftApp() {
     fun run(id: String, params: String) {
         val known = RibbonItem("", "", id, id, "{}", "")
         if (params == "{}") invoke(known) else cmd(id, params)
+    }
+
+    if (showFontPicker) {
+        FontPickerDialog(
+            onDismiss = { showFontPicker = false },
+            onPick = { name ->
+                showFontPicker = false
+                scope.launch {
+                    val ok = state.command("format.font", JSONObject().put("name", name).toString())
+                    if (ok && name == "Times New Roman") {
+                        state.status = "Times New Roman is drawn with Liberation Serif, which has the same character widths, so line and page breaks match Word."
+                    }
+                }
+            }
+        )
     }
 
     pendingParams?.let { item ->
@@ -247,7 +271,7 @@ private fun WordCraftApp() {
             }
             if (showFormat) {
                 FloatingPanel("Format", boundsW, boundsH, Offset(boundsW * 0.20f, 160f), onClose = { showFormat = false }, bodyHeight = 300.dp) {
-                    FormatPanelContent { id, params -> run(id, params) }
+                    FormatPanelContent(onPickFont = { showFontPicker = true }) { id, params -> run(id, params) }
                 }
             }
         }
