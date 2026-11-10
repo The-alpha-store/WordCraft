@@ -39,3 +39,16 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
+
+// Compile the Rust JNI bridge (against the vendored WordCraft engine) before the app builds.
+val buildWordCraftRust by tasks.registering(Exec::class) {
+    workingDir(rootProject.projectDir)
+    commandLine(
+        "cargo", "ndk", "-t", "arm64-v8a",
+        "-o", "app/src/main/jniLibs",
+        "build", "--release",
+        "--manifest-path", "rust/wordcraft_android_bridge/Cargo.toml"
+    )
+}
+
+tasks.named("preBuild") { dependsOn(buildWordCraftRust) }
