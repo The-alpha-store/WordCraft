@@ -43,4 +43,16 @@ object NativeBridge {
 
     /** Body headings for the navigation pane (JSON with a jump position for each). */
     external fun nativeHeadings(): String
+
+    /** Formatting at the selection (JSON): font, size, bold, italic, align, style... */
+    external fun nativeFormatState(): String
+
+    /** Word and character counts, whole document and selection (JSON). */
+    external fun nativeStats(): String
+
+    /** Rectangles of current find matches in page coordinates (JSON). */
+    external fun nativeFindHits(): String
+
+    /** Move only the selection anchor (drag the start handle). JSON result. */
+    external fun nativeMoveAnchor(page: Int, x: Float, y: Float): String
 }

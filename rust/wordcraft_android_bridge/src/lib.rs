@@ -459,6 +459,136 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeHeadings(
     java_string(&mut env, text)
 }
 
+// ---------------------------------------------------------------------------
+// Word-style live state: formatting at the selection, counts, find highlights, handles
+// ---------------------------------------------------------------------------
+
+/// Formatting in effect at the selection, resolved through styles like Word's ribbon shows it:
+/// `{"font","size","bold","italic","underline","strike","sub","sup","highlight","align","style","list"}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeFormatState(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(current) => {
+            let s: &Session = &current;
+            let cp = s.typing_props();
+            let para = s.doc.para_at(&s.sel.focus);
+            let pstyle = para.and_then(|p| p.props.style.clone());
+            let rc = s.doc.styles.resolve_char(pstyle.as_deref(), &cp);
+            let rp = para.map(|p| s.doc.styles.resolve_para(&p.props));
+            let lower = |v: String| v.to_lowercase();
+            let underline = lower(format!("{:?}", rc.underline));
+            let vert = lower(format!("{:?}", rc.vert_align));
+            json!({
+                "ok": true,
+                "font": rc.font,
+                "size": rc.size,
+                "bold": rc.bold,
+                "italic": rc.italic,
+                "underline": underline != "none",
+                "strike": rc.strike,
+                "sub": vert.contains("sub"),
+                "sup": vert.contains("super"),
+                "highlight": rc.highlight.is_some(),
+                "align": rp.as_ref().map(|p| lower(format!("{:?}", p.align))).unwrap_or_default(),
+                "style": rp.as_ref().map(|p| p.style.clone()).unwrap_or_default(),
+                "list": rp.as_ref().map(|p| p.numbering.is_some()).unwrap_or(false),
+            })
+            .to_string()
+        }
+        Err(_) => json!({"ok": false}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// `{"words":n,"chars":n,"selWords":n,"selChars":n}` for the status bar.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeStats(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(current) => {
+            let s: &Session = &current;
+            let (sel_words, sel_chars) = if s.sel.is_collapsed() {
+                (0, 0)
+            } else {
+                let t = s.selected_text();
+                (t.split_whitespace().count(), t.chars().filter(|c| !c.is_whitespace()).count())
+            };
+            let all = s.counted_text();
+            json!({
+                "ok": true,
+                "words": s.word_count(),
+                "chars": all.chars().filter(|c| !c.is_whitespace()).count(),
+                "selWords": sel_words,
+                "selChars": sel_chars,
+            })
+            .to_string()
+        }
+        Err(_) => json!({"ok": false}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Rectangles of the current find matches in page coordinates (points):
+/// `{"ok":true,"hits":[{"page","x","top","w","h"}]}` (single-line matches; capped at 300).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeFindHits(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let ranges: Vec<(wordcraft_engine::doc::Pos, wordcraft_engine::doc::Pos)> =
+                current.find.results.iter().take(300).cloned().collect();
+            let layout = current.layout();
+            let mut hits: Vec<Value> = Vec::new();
+            for (a, b) in ranges {
+                if let (Some(ca), Some(cb)) = (layout.caret(&a), layout.caret(&b)) {
+                    if ca.page == cb.page && (ca.top - cb.top).abs() < 1.0 && cb.x > ca.x {
+                        hits.push(json!({"page": ca.page, "x": ca.x, "top": ca.top, "w": cb.x - ca.x, "h": ca.height}));
+                    }
+                }
+            }
+            json!({"ok": true, "hits": hits}).to_string()
+        }
+        Err(_) => json!({"ok": false}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Drag the selection's anchor handle: move only the anchor to the point, keep the focus.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeMoveAnchor(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    page: jint,
+    x: jfloat,
+    y: jfloat,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let layout = current.layout();
+            let story = current.sel.focus.story;
+            let hit = usize::try_from(page).ok().and_then(|i| layout.hit(i, x, y, story));
+            match hit {
+                Some(pos) => {
+                    let pos = current.doc.clamp(&pos);
+                    let focus = current.sel.focus.clone();
+                    let params = json!({"anchor": pos, "focus": focus});
+                    json_result(current.run("select.range", &params).map(|_| json!({"hit": true})))
+                }
+                None => json!({"ok": true, "result": {"hit": false}}).to_string(),
+            }
+        }
+        Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
 #[cfg(test)]
 mod tests {
     //! Exercises the exact engine call sequence the JNI functions use (no JVM needed).
@@ -588,5 +718,36 @@ mod tests {
         let img = wordcraft_engine::render::render_page(&s.doc, &layout.pages[0], 1.0, &opts);
         let dark = img.pixels.chunks(4).filter(|p| p[0] < 128).count();
         assert!(dark > 50, "text rendered ({dark} dark px)");
+    }
+
+    #[test]
+    fn live_state_stats_find_and_styles() {
+        let mut s = Session::new(Document::new());
+        s.run("text.insert", &json!({"text": "alpha beta gamma beta"})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        s.run("format.bold", &json!({})).unwrap();
+        s.run("para.alignCenter", &json!({})).unwrap();
+        // Formatting state as nativeFormatState computes it.
+        let cp = s.typing_props();
+        let para = s.doc.para_at(&s.sel.focus);
+        let pstyle = para.and_then(|p| p.props.style.clone());
+        let rc = s.doc.styles.resolve_char(pstyle.as_deref(), &cp);
+        let rp = s.doc.styles.resolve_para(&para.unwrap().props);
+        assert!(rc.bold && !rc.italic);
+        assert!(format!("{:?}", rp.align).to_lowercase().contains("center"), "{:?}", rp.align);
+        assert_eq!(s.word_count(), 4);
+        assert_eq!(s.selected_text().split_whitespace().count(), 4);
+        // Find highlights.
+        let found = s.run("edit.find", &json!({"text": "beta", "highlight": true})).unwrap();
+        assert_eq!(found["count"], json!(2));
+        let ranges = s.find.results.len();
+        assert_eq!(ranges, 2, "two matches of beta");
+        // Style names the app's Styles gallery uses.
+        for style in ["Normal", "Title", "Subtitle", "Heading1", "Heading2", "Heading3", "Quote", "NoSpacing", "ListParagraph", "IntenseQuote"] {
+            let r = s.run("para.style", &json!({"style": style}));
+            eprintln!("style {style}: {}", if r.is_ok() { "ok" } else { "ERR" });
+        }
+        let r = s.run("layout.margins", &json!({"preset": "narrow"}));
+        eprintln!("margins preset: {r:?}");
     }
 }

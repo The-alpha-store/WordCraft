@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
@@ -135,32 +136,49 @@ fun commandIcon(id: String): ImageVector? = when (id) {
     else -> null
 }
 
-/** Compact Word-style title bar: save, undo, redo, document name, command search, overflow menu. */
+/** Compact Word-style title bar: back to home, name and save state, save, undo, redo, search, menu. */
 @Composable
 fun WordTitleBar(
     title: String,
     saved: Boolean,
+    autoSave: Boolean,
+    canUndo: Boolean,
+    canRedo: Boolean,
+    focusMode: Boolean,
+    onHome: () -> Unit,
     onSave: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onSearch: () -> Unit,
+    onToggleAutoSave: () -> Unit,
+    onToggleFocus: () -> Unit,
     onMenuItem: (String) -> Unit
 ) {
     var menu by remember { mutableStateOf(false) }
     Row(
-        Modifier.fillMaxWidth().height(48.dp).background(ChromeGrey).padding(horizontal = 4.dp),
+        Modifier.fillMaxWidth().height(52.dp).background(ChromeGrey).padding(horizontal = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        IconButton(onClick = onHome) { Icon(Icons.Default.ArrowBack, "Home") }
+        Column(Modifier.weight(1f).padding(horizontal = 2.dp)) {
+            Text(
+                title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+            Text(
+                when {
+                    !saved && autoSave -> "Saving…"
+                    !saved -> "Not saved"
+                    autoSave -> "Saved · AutoSave on"
+                    else -> "Saved"
+                },
+                fontSize = 11.sp, color = if (saved) Color(0xFF2E7D32) else Color(0xFF8A6D00)
+            )
+        }
         IconButton(onClick = onSave) { Icon(Icons.Default.Save, "Save") }
-        IconButton(onClick = onUndo) { Icon(Icons.Default.Undo, "Undo") }
-        IconButton(onClick = onRedo) { Icon(Icons.Default.Redo, "Redo") }
-        Text(
-            "$title — ${if (saved) "Saved" else "Not saved"}",
-            Modifier.weight(1f).padding(horizontal = 6.dp),
-            fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
-            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-        )
-        IconButton(onClick = onSearch) { Icon(Icons.Default.Search, "Search commands") }
+        IconButton(onClick = onUndo, enabled = canUndo) { Icon(Icons.Default.Undo, "Undo") }
+        IconButton(onClick = onRedo, enabled = canRedo) { Icon(Icons.Default.Redo, "Redo") }
+        IconButton(onClick = onSearch) { Icon(Icons.Default.Search, "Tell me what you want to do") }
         Box {
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "More") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
@@ -168,17 +186,28 @@ fun WordTitleBar(
                     "Export PDF…" to "file.exportPdf", "Fit page to screen" to "view.pageWidth").forEach { (label, id) ->
                     DropdownMenuItem(text = { Text(label) }, onClick = { menu = false; onMenuItem(id) })
                 }
+                DropdownMenuItem(
+                    text = { Text("AutoSave: ${if (autoSave) "On" else "Off"}") },
+                    onClick = { menu = false; onToggleAutoSave() }
+                )
+                DropdownMenuItem(
+                    text = { Text(if (focusMode) "Exit focus mode" else "Focus mode") },
+                    onClick = { menu = false; onToggleFocus() }
+                )
             }
         }
     }
 }
 
+private class QuickItem(val id: String, val active: Boolean, val params: String = "{}")
+
 /**
  * Bottom quick-action bar: panel toggles on the left, the most-used editing actions after them.
- * It stays above the keyboard.
+ * The actions light up when they are on at the cursor. It stays above the keyboard.
  */
 @Composable
 fun QuickBar(
+    fmt: FormatState,
     navOpen: Boolean,
     stylesOpen: Boolean,
     formatOpen: Boolean,
@@ -187,6 +216,15 @@ fun QuickBar(
     onToggleFormat: () -> Unit,
     onAction: (String, String) -> Unit
 ) {
+    val items = listOf(
+        QuickItem("format.bold", fmt.bold), QuickItem("format.italic", fmt.italic), QuickItem("format.underline", fmt.underline),
+        QuickItem("para.bullets", fmt.list), QuickItem("para.numbering", false),
+        QuickItem("para.alignLeft", fmt.align.contains("left") || fmt.align == "start"),
+        QuickItem("para.alignCenter", fmt.align.contains("center")),
+        QuickItem("para.alignRight", fmt.align.contains("right") || fmt.align == "end"),
+        QuickItem("para.indent", false), QuickItem("para.outdent", false),
+        QuickItem("insert.picture", false), QuickItem("insert.table", false), QuickItem("insert.link", false)
+    )
     Column(Modifier.fillMaxWidth().background(Color.White)) {
         HorizontalDivider(color = Color(0xFFE1E1E1))
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -194,18 +232,59 @@ fun QuickBar(
             PanelToggle(Icons.Default.Title, "Styles", stylesOpen, onToggleStyles)
             PanelToggle(Icons.Default.Palette, "Format", formatOpen, onToggleFormat)
             Box(Modifier.width(1.dp).height(28.dp).background(Color(0xFFD0D0D0)))
-            listOf(
-                "format.bold" to "{}", "format.italic" to "{}", "format.underline" to "{}",
-                "para.bullets" to "{}", "para.numbering" to "{}",
-                "para.alignLeft" to "{}", "para.alignCenter" to "{}", "para.alignRight" to "{}",
-                "para.indent" to "{}", "para.outdent" to "{}",
-                "insert.picture" to "{}", "insert.table" to "{\"rows\":3,\"cols\":3}", "insert.link" to "{}"
-            ).forEach { (id, params) ->
-                IconButton(onClick = { onAction(id, params) }, Modifier.size(46.dp)) {
-                    Icon(commandIcon(id) ?: Icons.Default.Menu, id, Modifier.size(24.dp))
+            items.forEach { item ->
+                Box(
+                    Modifier
+                        .padding(horizontal = 1.dp)
+                        .size(44.dp)
+                        .background(if (item.active) Color(0xFFDCE8FA) else Color.Transparent, RoundedCornerShape(10.dp))
+                        .clickable { onAction(item.id, item.params) },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(commandIcon(item.id) ?: Icons.Default.Menu, item.id, Modifier.size(23.dp), tint = if (item.active) WordBlue else Color(0xFF242424))
                 }
             }
         }
+    }
+}
+
+/** Bottom status bar: page and word counts on the left; Focus and a zoom slider on the right. */
+@Composable
+fun WordStatusBar(state: EditorState, focusMode: Boolean, onToggleFocus: () -> Unit) {
+    val pageNumber = (state.focus?.page ?: state.visiblePage) + 1
+    val st = state.stats
+    val words = if (st.selWords > 0) "${st.selWords} of ${st.words} words" else "${st.words} words"
+    Row(
+        Modifier.fillMaxWidth().background(ChromeGrey).padding(start = 12.dp, end = 8.dp).height(36.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text("Page $pageNumber of ${state.pages.size.coerceAtLeast(1)}  ·  $words", Modifier.weight(1f), fontSize = 11.sp, maxLines = 1)
+        Text(
+            if (focusMode) "Exit focus" else "Focus",
+            Modifier.clickable(onClick = onToggleFocus).padding(horizontal = 8.dp, vertical = 6.dp),
+            fontSize = 12.sp, color = WordBlue, fontWeight = FontWeight.Medium
+        )
+        androidx.compose.material3.Slider(
+            value = state.zoom,
+            onValueChange = { state.zoom = it },
+            valueRange = 0.6f..2.5f,
+            modifier = Modifier.width(110.dp)
+        )
+        Text("${(state.zoom * 100).toInt()}%", Modifier.width(40.dp), fontSize = 11.sp)
+    }
+}
+
+/** A short message pill (saved, errors, results) that fades on its own. */
+@Composable
+fun StatusPill(text: String, modifier: Modifier = Modifier) {
+    if (text.isBlank()) return
+    Box(
+        modifier
+            .padding(12.dp)
+            .background(Color(0xE6262626), RoundedCornerShape(22.dp))
+            .padding(horizontal = 16.dp, vertical = 10.dp)
+    ) {
+        Text(text, color = Color.White, fontSize = 13.sp, maxLines = 3)
     }
 }
 

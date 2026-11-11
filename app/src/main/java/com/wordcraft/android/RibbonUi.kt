@@ -202,12 +202,12 @@ fun ParamDialog(item: RibbonItem, onDismiss: () -> Unit, onRun: (String) -> Unit
     )
 }
 
-private fun isNumeric(type: String): Boolean {
+internal fun isNumeric(type: String): Boolean {
     val t = type.lowercase()
     return Regex("\\b(n|number|int|integer|float|pt|px|cm|mm|ratio|percent|index|count)\\b").containsMatchIn(t)
 }
 
-private fun buildParams(fields: List<ParamField>, values: Map<String, String>): String {
+internal fun buildParams(fields: List<ParamField>, values: Map<String, String>): String {
     val out = JSONObject()
     for (f in fields) {
         val raw = values[f.name]?.trim().orEmpty()

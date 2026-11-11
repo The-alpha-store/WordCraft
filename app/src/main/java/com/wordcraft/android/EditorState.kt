@@ -20,6 +20,29 @@ data class PageInfo(val w: Float, val h: Float, val bx: Float, val by: Float, va
 /** Caret bar in page coordinates (points). */
 data class CaretGeo(val page: Int, val x: Float, val top: Float, val height: Float)
 
+/** Formatting in effect at the selection, resolved through styles (what Word's ribbon shows). */
+data class FormatState(
+    val font: String = "",
+    val size: Float = 11f,
+    val bold: Boolean = false,
+    val italic: Boolean = false,
+    val underline: Boolean = false,
+    val strike: Boolean = false,
+    val sub: Boolean = false,
+    val sup: Boolean = false,
+    val highlight: Boolean = false,
+    val align: String = "left",
+    val style: String = "",
+    val list: Boolean = false
+)
+
+data class DocStats(val words: Int = 0, val chars: Int = 0, val selWords: Int = 0, val selChars: Int = 0)
+
+/** A find match rectangle in page coordinates (points). */
+data class FindHit(val page: Int, val x: Float, val top: Float, val w: Float, val h: Float)
+
+class CmdResult(val ok: Boolean, val result: Any?)
+
 /**
  * Holds what the UI needs to draw, and funnels every engine call through one lock so edits,
  * hit-tests and renders never interleave. The Rust engine remains the only document model.
@@ -33,14 +56,22 @@ class EditorState {
     /** Commands the engine currently reports as disabled, with its reason. */
     var disabled by mutableStateOf<Map<String, String>>(emptyMap()); private set
 
+    /** Live formatting at the selection and document counts, refreshed after every change. */
+    var fmt by mutableStateOf(FormatState()); private set
+    var stats by mutableStateOf(DocStats()); private set
+
+    /** While true, find matches are highlighted on the pages. */
+    var findActive by mutableStateOf(false)
+    var findHits by mutableStateOf<List<FindHit>>(emptyList()); private set
+
     /** Bumped after every engine change; page bitmaps are re-rendered when it changes. */
     var revision by mutableIntStateOf(0); private set
     var zoom by mutableFloatStateOf(1f)
     var status by mutableStateOf("")
+    var dirty by mutableStateOf(false)
 
     /** First page currently visible in the scrolling canvas (0-based), for the status bar. */
     var visiblePage by mutableIntStateOf(0)
-    var dirty by mutableStateOf(false)
 
     /** Set to ask the canvas to scroll to a page position; [nonce] makes repeats distinct. */
     data class ScrollTarget(val page: Int, val yPoints: Float, val nonce: Long)
@@ -51,95 +82,167 @@ class EditorState {
         scrollTarget = ScrollTarget(page, yPoints, ++scrollNonce)
     }
 
+    /** Scroll so the caret is visible. */
+    fun scrollToCaret() {
+        focus?.let { scrollTo(it.page, (it.top - 60f).coerceAtLeast(0f)) }
+    }
+
     /** Move the caret to a position described by the engine (a Pos as JSON) and scroll to it. */
     suspend fun goTo(posJson: String) {
         val pos = JSONObject(posJson)
         val ok = command("select.range", JSONObject().put("anchor", pos).put("focus", pos).toString(), edits = false)
-        if (ok) focus?.let { scrollTo(it.page, (it.top - 40f).coerceAtLeast(0f)) }
+        if (ok) scrollToCaret()
     }
 
     private val gate = Mutex()
 
-    /** Re-read page sizes and caret geometry from the engine. Caller must hold [gate]. */
-    private suspend fun refreshLocked() = withContext(Dispatchers.IO) {
-        val layout = JSONObject(NativeBridge.nativeLayoutInfo())
-        val arr = layout.optJSONArray("pages")
-        val list = ArrayList<PageInfo>()
-        if (arr != null) for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            list += PageInfo(
-                o.getDouble("w").toFloat(), o.getDouble("h").toFloat(),
-                o.optDouble("bx", 0.0).toFloat(), o.optDouble("by", 0.0).toFloat(),
-                o.optDouble("bw", o.getDouble("w")).toFloat(), o.optDouble("bh", o.getDouble("h")).toFloat()
+    private class Snapshot(
+        val pages: List<PageInfo>,
+        val focus: CaretGeo?,
+        val anchor: CaretGeo?,
+        val collapsed: Boolean,
+        val disabled: Map<String, String>,
+        val fmt: FormatState,
+        val stats: DocStats,
+        val hits: List<FindHit>
+    )
+
+    /** Re-read everything the UI shows from the engine. Caller must hold [gate]. */
+    private suspend fun refreshLocked() {
+        val wantHits = findActive
+        val snap = withContext(Dispatchers.IO) {
+            val layout = JSONObject(NativeBridge.nativeLayoutInfo())
+            val arr = layout.optJSONArray("pages")
+            val list = ArrayList<PageInfo>()
+            if (arr != null) for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                list += PageInfo(
+                    o.getDouble("w").toFloat(), o.getDouble("h").toFloat(),
+                    o.optDouble("bx", 0.0).toFloat(), o.optDouble("by", 0.0).toFloat(),
+                    o.optDouble("bw", o.getDouble("w")).toFloat(), o.optDouble("bh", o.getDouble("h")).toFloat()
+                )
+            }
+            val caret = JSONObject(NativeBridge.nativeCaretInfo())
+            fun geo(key: String): CaretGeo? = caret.optJSONObject(key)?.let {
+                CaretGeo(it.getInt("page"), it.getDouble("x").toFloat(), it.getDouble("top").toFloat(), it.getDouble("height").toFloat())
+            }
+            val off = JSONObject(NativeBridge.nativeDisabledCommands())
+            val offMap = HashMap<String, String>()
+            off.keys().forEach { k -> offMap[k] = off.optString(k) }
+
+            val f = JSONObject(NativeBridge.nativeFormatState())
+            val format = FormatState(
+                font = f.optString("font"),
+                size = f.optDouble("size", 11.0).toFloat(),
+                bold = f.optBoolean("bold"),
+                italic = f.optBoolean("italic"),
+                underline = f.optBoolean("underline"),
+                strike = f.optBoolean("strike"),
+                sub = f.optBoolean("sub"),
+                sup = f.optBoolean("sup"),
+                highlight = f.optBoolean("highlight"),
+                align = f.optString("align", "left"),
+                style = f.optString("style"),
+                list = f.optBoolean("list")
             )
+            val st = JSONObject(NativeBridge.nativeStats())
+            val counts = DocStats(st.optInt("words"), st.optInt("chars"), st.optInt("selWords"), st.optInt("selChars"))
+
+            val hits = ArrayList<FindHit>()
+            if (wantHits) {
+                val ha = JSONObject(NativeBridge.nativeFindHits()).optJSONArray("hits")
+                if (ha != null) for (i in 0 until ha.length()) {
+                    val h = ha.getJSONObject(i)
+                    hits += FindHit(h.getInt("page"), h.getDouble("x").toFloat(), h.getDouble("top").toFloat(),
+                        h.getDouble("w").toFloat(), h.getDouble("h").toFloat())
+                }
+            }
+            Snapshot(list, geo("focus"), geo("anchor"), caret.optBoolean("collapsed", true), offMap, format, counts, hits)
         }
-        val caret = JSONObject(NativeBridge.nativeCaretInfo())
-        fun geo(key: String): CaretGeo? = caret.optJSONObject(key)?.let {
-            CaretGeo(it.getInt("page"), it.getDouble("x").toFloat(), it.getDouble("top").toFloat(), it.getDouble("height").toFloat())
-        }
-        val off = JSONObject(NativeBridge.nativeDisabledCommands())
-        val offMap = HashMap<String, String>()
-        off.keys().forEach { k -> offMap[k] = off.optString(k) }
-        Pair(Triple(list, geo("focus") to geo("anchor"), caret.optBoolean("collapsed", true)), offMap as Map<String, String>)
-    }.let { (triple, offMap) ->
-        val (list, carets, isCollapsed) = triple
-        disabled = offMap
-        pages = list
-        focus = carets.first
-        anchor = carets.second
-        collapsed = isCollapsed
+        pages = snap.pages
+        focus = snap.focus
+        anchor = snap.anchor
+        collapsed = snap.collapsed
+        disabled = snap.disabled
+        fmt = snap.fmt
+        stats = snap.stats
+        findHits = snap.hits
         revision++
     }
 
-    suspend fun refresh() = gate.withLock { refreshLocked() }
+    suspend fun refresh() {
+        gate.withLock { refreshLocked() }
+    }
 
-    /** Run any engine command. Returns true when the engine reported success. */
-    suspend fun command(id: String, params: String = "{}", edits: Boolean = true): Boolean = gate.withLock {
+    /** Run an engine command and return its result object too. */
+    suspend fun exec(id: String, params: String = "{}", edits: Boolean = true): CmdResult = gate.withLock {
         val raw = withContext(Dispatchers.IO) { NativeBridge.nativeRunCommand(id, params) }
-        val ok = runCatching { JSONObject(raw).optBoolean("ok") }.getOrDefault(false)
+        val json = runCatching { JSONObject(raw) }.getOrNull()
+        val ok = json?.optBoolean("ok") ?: false
+        var result: Any? = null
         if (!ok) {
-            status = runCatching { JSONObject(raw).optString("error", "Command failed") }.getOrDefault(raw)
+            status = json?.optString("error", "Command failed") ?: raw
         } else {
-            // Some commands return information (word count, search hits...): show it.
-            val shown = runCatching {
-                val r = JSONObject(raw).opt("result")
-                if (r == null || r == JSONObject.NULL) "" else r.toString()
-            }.getOrDefault("")
-            status = if (shown.length > 2 && shown != "{}" && shown != "[]") shown.take(400) else ""
+            result = json?.opt("result")?.takeIf { it != JSONObject.NULL }
+            // Some commands return information (word count, search hits...): show short ones.
+            val shown = result?.toString().orEmpty()
+            status = if (shown.length in 3..120 && shown != "{}" && shown != "[]" && result !is JSONObject) shown else ""
         }
         if (ok && edits) dirty = true
         refreshLocked()
-        ok
+        CmdResult(ok, result)
     }
 
+    /** Run any engine command. Returns true when the engine reported success. */
+    suspend fun command(id: String, params: String = "{}", edits: Boolean = true): Boolean = exec(id, params, edits).ok
+
     /** Place the caret (or extend the selection) at a page point given in points. */
-    suspend fun hit(page: Int, x: Float, y: Float, extend: Boolean) = gate.withLock {
-        withContext(Dispatchers.IO) { NativeBridge.nativeHitTest(page, x, y, extend) }
-        refreshLocked()
+    suspend fun hit(page: Int, x: Float, y: Float, extend: Boolean) {
+        gate.withLock {
+            withContext(Dispatchers.IO) { NativeBridge.nativeHitTest(page, x, y, extend) }
+            refreshLocked()
+        }
+    }
+
+    /** Drag the selection's start handle: only the anchor moves. */
+    suspend fun moveAnchor(page: Int, x: Float, y: Float) {
+        gate.withLock {
+            withContext(Dispatchers.IO) { NativeBridge.nativeMoveAnchor(page, x, y) }
+            refreshLocked()
+        }
     }
 
     /** Type text at the caret / over the selection. '\n' starts a new paragraph. */
-    suspend fun typeText(text: String) = gate.withLock {
-        withContext(Dispatchers.IO) {
-            val parts = text.split('\n')
-            parts.forEachIndexed { i, part ->
-                if (i > 0) NativeBridge.nativeRunCommand("text.newParagraph", "{}")
-                if (part.isNotEmpty()) {
-                    NativeBridge.nativeRunCommand("text.insert", JSONObject().put("text", part).toString())
+    suspend fun typeText(text: String) {
+        gate.withLock {
+            withContext(Dispatchers.IO) {
+                val parts = text.split('\n')
+                parts.forEachIndexed { i, part ->
+                    if (i > 0) NativeBridge.nativeRunCommand("text.newParagraph", "{}")
+                    if (part.isNotEmpty()) {
+                        NativeBridge.nativeRunCommand("text.insert", JSONObject().put("text", part).toString())
+                    }
                 }
             }
+            dirty = true
+            refreshLocked()
         }
-        dirty = true
-        refreshLocked()
     }
 
-    suspend fun backspace() = gate.withLock {
-        withContext(Dispatchers.IO) { NativeBridge.nativeRunCommand("text.backspace", "{}") }
-        dirty = true
-        refreshLocked()
+    suspend fun backspace() {
+        gate.withLock {
+            withContext(Dispatchers.IO) { NativeBridge.nativeRunCommand("text.backspace", "{}") }
+            dirty = true
+            refreshLocked()
+        }
     }
 
     suspend fun selectedText(): String = withContext(Dispatchers.IO) { NativeBridge.nativeGetSelection() }
+
+    /** The whole document saved as bytes (DOCX, or PDF by file name). */
+    suspend fun save(fileName: String): ByteArray? = gate.withLock {
+        withContext(Dispatchers.IO) { NativeBridge.nativeSaveDocument(fileName) }
+    }
 
     /** Render one page at [pxPerPoint] pixels per point. */
     suspend fun renderPage(index: Int, pxPerPoint: Float): Bitmap? = gate.withLock {

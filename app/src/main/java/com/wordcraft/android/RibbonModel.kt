@@ -70,6 +70,24 @@ object RibbonModel {
         }.toList()
     }
 
-    /** True when the command has at least one required parameter and so needs input first. */
-    fun needsInput(params: String): Boolean = fields(params).any { !it.optional }
+    /**
+     * True when the command needs the user to choose something before running: a required
+     * parameter, an enumerated choice, or values that are all optional but not on/off switches.
+     * Simple on/off toggles (an optional boolean) run immediately.
+     */
+    fun needsInput(params: String): Boolean {
+        val f = fields(params)
+        if (f.isEmpty()) return false
+        if (f.any { !it.optional }) return true
+        if (f.any { options(it.type) != null }) return true
+        return f.any { !it.type.lowercase().contains("bool") }
+    }
+
+    /** Choices of an enumerated parameter such as `"normal|narrow|wide"`, or null. */
+    fun options(type: String): List<String>? {
+        val parts = type.replace("\"", "").split('|').map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.size < 2) return null
+        val ok = parts.all { Regex("[A-Za-z0-9_.+-]{1,24}").matches(it) }
+        return if (ok) parts else null
+    }
 }
