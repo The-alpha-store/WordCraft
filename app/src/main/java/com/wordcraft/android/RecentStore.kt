@@ -8,7 +8,7 @@ import org.json.JSONObject
 import java.io.File
 
 /** A document the user created, opened or saved, remembered for the home screen. */
-data class RecentDoc(val uri: String, val name: String, val openedAt: Long, val sizeBytes: Long, val action: String)
+data class RecentDoc(val uri: String, val name: String, val openedAt: Long, val sizeBytes: Long, val action: String, val pinned: Boolean = false)
 
 /** One entry of the activity timeline ("Edited Report.docx"). */
 data class ActivityEvent(val time: Long, val action: String, val name: String, val uri: String)
@@ -25,7 +25,7 @@ class RecentStore(private val context: Context) {
         val arr = JSONArray(prefs.getString("docs", "[]"))
         (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
-            RecentDoc(o.getString("uri"), o.getString("name"), o.getLong("t"), o.optLong("size"), o.optString("action", "Opened"))
+            RecentDoc(o.getString("uri"), o.getString("name"), o.getLong("t"), o.optLong("size"), o.optString("action", "Opened"), o.optBoolean("pin"))
         }.sortedByDescending { it.openedAt }
     }.getOrDefault(emptyList())
 
@@ -40,13 +40,11 @@ class RecentStore(private val context: Context) {
     /** Add or refresh a document and record the activity ("Created", "Opened", "Edited", "Saved"...). */
     fun touch(uri: String, name: String, sizeBytes: Long, action: String) {
         val now = System.currentTimeMillis()
-        val list = docs().filter { it.uri != uri }.toMutableList()
-        list.add(0, RecentDoc(uri, name, now, sizeBytes, action))
-        val arr = JSONArray()
-        list.take(60).forEach {
-            arr.put(JSONObject().put("uri", it.uri).put("name", it.name).put("t", it.openedAt).put("size", it.sizeBytes).put("action", it.action))
-        }
-        prefs.edit().putString("docs", arr.toString()).apply()
+        val old = docs()
+        val wasPinned = old.firstOrNull { it.uri == uri }?.pinned ?: false
+        val list = old.filter { it.uri != uri }.toMutableList()
+        list.add(0, RecentDoc(uri, name, now, sizeBytes, action, wasPinned))
+        write(list.take(60))
         log(action, name, uri)
     }
 
@@ -62,13 +60,29 @@ class RecentStore(private val context: Context) {
         prefs.edit().putString("events", arr.toString()).apply()
     }
 
-    fun remove(uri: String) {
+    private fun write(list: List<RecentDoc>) {
         val arr = JSONArray()
-        docs().filter { it.uri != uri }.forEach {
-            arr.put(JSONObject().put("uri", it.uri).put("name", it.name).put("t", it.openedAt).put("size", it.sizeBytes).put("action", it.action))
+        list.forEach {
+            arr.put(JSONObject().put("uri", it.uri).put("name", it.name).put("t", it.openedAt).put("size", it.sizeBytes)
+                .put("action", it.action).put("pin", it.pinned))
         }
         prefs.edit().putString("docs", arr.toString()).apply()
+    }
+
+    fun remove(uri: String) {
+        write(docs().filter { it.uri != uri })
         thumbFile(uri).delete()
+    }
+
+    fun togglePin(uri: String) {
+        write(docs().map { if (it.uri == uri) it.copy(pinned = !it.pinned) else it })
+    }
+
+    /** Forget every document that isn't pinned. */
+    fun clearUnpinned() {
+        val keep = docs().filter { it.pinned }
+        docs().filter { !it.pinned }.forEach { thumbFile(it.uri).delete() }
+        write(keep)
     }
 
     private fun thumbFile(uri: String) = File(thumbDir, "${uri.hashCode().toUInt()}.png")

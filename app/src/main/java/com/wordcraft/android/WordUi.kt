@@ -183,7 +183,7 @@ fun WordTitleBar(
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "More") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 listOf("New" to "file.new", "Open…" to "file.open", "Save as DOCX…" to "file.saveAs",
-                    "Export PDF…" to "file.exportPdf", "Fit page to screen" to "view.pageWidth").forEach { (label, id) ->
+                    "Export PDF…" to "file.exportPdf", "Share…" to "file.share", "Fit page to screen" to "view.pageWidth").forEach { (label, id) ->
                     DropdownMenuItem(text = { Text(label) }, onClick = { menu = false; onMenuItem(id) })
                 }
                 DropdownMenuItem(

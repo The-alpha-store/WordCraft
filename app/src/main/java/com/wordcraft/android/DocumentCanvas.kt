@@ -2,6 +2,7 @@ package com.wordcraft.android
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -213,7 +215,8 @@ private fun PageView(
             .pointerInput(index, pxPerPoint) {
                 detectTapGestures(
                     onTap = { offset ->
-                        scope.launch { state.hit(index, offset.x / pxPerPoint, offset.y / pxPerPoint, false) }
+                        // A picture or shape under the finger is selected; otherwise the caret moves.
+                        scope.launch { state.tap(index, offset.x / pxPerPoint, offset.y / pxPerPoint) }
                         onTouched()
                     },
                     onDoubleTap = { offset ->
@@ -245,17 +248,18 @@ private fun PageView(
         Canvas(Modifier.fillMaxSize()) {
             image?.let { drawImage(it, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt())) }
             drawFindHits(state, index, pxPerPoint)
-            drawSelection(state, index, info, pxPerPoint)
+            if (state.selObject == null) drawSelection(state, index, info, pxPerPoint)
             if (state.collapsed && caretOn) drawCaret(state, index, pxPerPoint)
         }
 
-        if (!state.collapsed) {
+        if (!state.collapsed && state.selObject == null) {
             val a = state.anchor
             val f = state.focus
             if (a != null && a.page == index) SelectionHandle(state, index, pxPerPoint, isAnchor = true)
             if (f != null && f.page == index) SelectionHandle(state, index, pxPerPoint, isAnchor = false)
             MiniToolbar(state, index, info, pxPerPoint, onCommand)
         }
+        if (state.selObject?.page == index) ObjectOverlay(state, index, info, pxPerPoint, onCommand)
     }
 }
 
@@ -418,4 +422,146 @@ private fun ImeCapture(state: EditorState, focusRequester: FocusRequester, modif
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
         modifier = modifier.size(1.dp).alpha(0f).focusRequester(focusRequester).padding(0.dp)
     )
+}
+
+private data class Frame(val x: Float, val y: Float, val w: Float, val h: Float)
+
+/**
+ * Frame, eight resize handles and a toolbar for the selected picture or shape. Corner handles
+ * keep the proportions; side handles stretch one way. A floating (wrapped) picture can also be
+ * dragged to a new place. The change is committed to the engine when the finger lifts.
+ */
+@Composable
+private fun ObjectOverlay(state: EditorState, index: Int, info: PageInfo, ppp: Float, onCommand: (String, String) -> Unit) {
+    val obj = state.selObject ?: return
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    var live by remember { mutableStateOf<Frame?>(null) }
+    val liveNow by rememberUpdatedState(live)
+    val objNow by rememberUpdatedState(obj)
+    val frame = live ?: Frame(obj.x, obj.y, obj.w, obj.h)
+    val handleBox = with(density) { 36.dp.toPx() }
+
+    fun commit(f: Frame, moved: Boolean) {
+        live = null
+        val o = objNow
+        scope.launch {
+            val params = org.json.JSONObject().put("width", f.w.toDouble()).put("height", f.h.toDouble())
+            if (o.floating) {
+                params.put("page", index).put("x", f.x.toDouble()).put("y", f.y.toDouble())
+                state.command("arrange.bounds", params.toString())
+            } else if (!moved) {
+                params.put("lockAspect", false)
+                state.command("picture.size", params.toString())
+            }
+        }
+    }
+
+    // The frame outline.
+    Canvas(Modifier.fillMaxSize()) {
+        drawRect(
+            WordBlue, Offset(frame.x * ppp, frame.y * ppp), Size(frame.w * ppp, frame.h * ppp),
+            style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3f)
+        )
+    }
+
+    // Drag the picture itself (floating pictures only).
+    if (obj.floating) {
+        var acc by remember { mutableStateOf(Offset.Zero) }
+        var start by remember { mutableStateOf<Frame?>(null) }
+        Box(
+            Modifier
+                .offset { IntOffset((frame.x * ppp).roundToInt(), (frame.y * ppp).roundToInt()) }
+                .size(with(density) { (frame.w * ppp).toDp() }, with(density) { (frame.h * ppp).toDp() })
+                .pointerInput(Unit) {
+                    detectDragGestures(
+                        onDragStart = { acc = Offset.Zero; start = Frame(objNow.x, objNow.y, objNow.w, objNow.h) },
+                        onDrag = { change, drag ->
+                            change.consume()
+                            acc += drag
+                            val s0 = start ?: return@detectDragGestures
+                            live = Frame(s0.x + acc.x / ppp, s0.y + acc.y / ppp, s0.w, s0.h)
+                        },
+                        onDragEnd = { liveNow?.let { commit(it, moved = true) } },
+                        onDragCancel = { live = null }
+                    )
+                }
+        )
+    }
+
+    // Eight resize handles.
+    val spots = listOf(0f to 0f, 0.5f to 0f, 1f to 0f, 0f to 0.5f, 1f to 0.5f, 0f to 1f, 0.5f to 1f, 1f to 1f)
+    spots.forEach { (fx, fy) ->
+        var acc by remember { mutableStateOf(Offset.Zero) }
+        var start by remember { mutableStateOf<Frame?>(null) }
+        Box(
+            Modifier
+                .offset {
+                    IntOffset(
+                        ((frame.x + fx * frame.w) * ppp - handleBox / 2f).roundToInt(),
+                        ((frame.y + fy * frame.h) * ppp - handleBox / 2f).roundToInt()
+                    )
+                }
+                .size(36.dp)
+                .pointerInput(fx, fy) {
+                    detectDragGestures(
+                        onDragStart = { acc = Offset.Zero; start = Frame(objNow.x, objNow.y, objNow.w, objNow.h) },
+                        onDrag = { change, drag ->
+                            change.consume()
+                            acc += drag
+                            val s0 = start ?: return@detectDragGestures
+                            val dx = acc.x / ppp
+                            val dy = acc.y / ppp
+                            var x = s0.x; var y = s0.y; var w = s0.w; var h = s0.h
+                            if (fx == 0f) { x += dx; w -= dx } else if (fx == 1f) w += dx
+                            if (fy == 0f) { y += dy; h -= dy } else if (fy == 1f) h += dy
+                            val corner = fx != 0.5f && fy != 0.5f
+                            if (corner) {
+                                val k = max(w / s0.w, h / s0.h).coerceAtLeast(12f / s0.w)
+                                w = s0.w * k; h = s0.h * k
+                                if (fx == 0f) x = s0.x + s0.w - w
+                                if (fy == 0f) y = s0.y + s0.h - h
+                            }
+                            w = w.coerceAtLeast(12f); h = h.coerceAtLeast(12f)
+                            live = Frame(x, y, w, h)
+                        },
+                        onDragEnd = { liveNow?.let { commit(it, moved = false) } },
+                        onDragCancel = { live = null }
+                    )
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Box(Modifier.size(14.dp).background(Color.White, CircleShape).border(2.dp, WordBlue, CircleShape))
+        }
+    }
+
+    // Toolbar above (or below) the frame.
+    val toolbarWidthPx = with(density) { 340.dp.toPx() }
+    val pageW = info.w * ppp
+    val tx = (frame.x * ppp).coerceIn(0f, max(0f, pageW - toolbarWidthPx))
+    val above = frame.y * ppp - with(density) { 52.dp.toPx() }
+    val ty = if (above >= 0f) above else (frame.y + frame.h) * ppp + with(density) { 22.dp.toPx() }
+    Row(
+        Modifier
+            .offset { IntOffset(tx.roundToInt(), ty.roundToInt()) }
+            .shadow(8.dp, RoundedCornerShape(12.dp))
+            .background(Color.White, RoundedCornerShape(12.dp))
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val items = if (obj.picture) listOf(
+            "Wrap" to "arrange.wrap", "Rotate" to "arrange.rotate", "Size" to "picture.size", "Border" to "picture.border",
+            "Alt text" to "picture.altText", "Reset" to "picture.reset", "Delete" to "text.backspace"
+        ) else listOf("Wrap" to "arrange.wrap", "Rotate" to "arrange.rotate", "Delete" to "text.backspace")
+        Row(Modifier.widthIn(max = 340.dp).horizontalScroll(rememberScrollState())) {
+            items.forEach { (label, id) ->
+                Box(
+                    Modifier.padding(horizontal = 2.dp)
+                        .background(if (id == "text.backspace") Color(0xFFFDECEA) else Color(0xFFF2F4F7), RoundedCornerShape(10.dp))
+                        .clickable { onCommand(id, "{}") }
+                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                ) { Text(label, fontSize = 13.sp, color = if (id == "text.backspace") Color(0xFFB42318) else Color(0xFF242424)) }
+            }
+        }
+    }
 }

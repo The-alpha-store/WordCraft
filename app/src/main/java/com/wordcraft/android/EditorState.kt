@@ -41,6 +41,9 @@ data class DocStats(val words: Int = 0, val chars: Int = 0, val selWords: Int = 
 /** A find match rectangle in page coordinates (points). */
 data class FindHit(val page: Int, val x: Float, val top: Float, val w: Float, val h: Float)
 
+/** The selected picture or shape: its frame in page points. */
+data class ObjInfo(val page: Int, val x: Float, val y: Float, val w: Float, val h: Float, val floating: Boolean, val picture: Boolean)
+
 class CmdResult(val ok: Boolean, val result: Any?)
 
 /**
@@ -59,6 +62,15 @@ class EditorState {
     /** Live formatting at the selection and document counts, refreshed after every change. */
     var fmt by mutableStateOf(FormatState()); private set
     var stats by mutableStateOf(DocStats()); private set
+
+    /** Pressed state of toggle commands such as Show/Hide marks and Track Changes. */
+    var toggles by mutableStateOf<Map<String, Boolean>>(emptyMap()); private set
+
+    /** The picture or shape selected on the page, if any. */
+    var selObject by mutableStateOf<ObjInfo?>(null); private set
+
+    /** True when the caret is in a table (the engine enables table commands only there). */
+    val inTable: Boolean get() = disabled.isNotEmpty() && disabled["table.insertRowBelow"] == null
 
     /** While true, find matches are highlighted on the pages. */
     var findActive by mutableStateOf(false)
@@ -104,7 +116,9 @@ class EditorState {
         val disabled: Map<String, String>,
         val fmt: FormatState,
         val stats: DocStats,
-        val hits: List<FindHit>
+        val hits: List<FindHit>,
+        val toggles: Map<String, Boolean>,
+        val obj: ObjInfo?
     )
 
     /** Re-read everything the UI shows from the engine. Caller must hold [gate]. */
@@ -157,7 +171,15 @@ class EditorState {
                         h.getDouble("w").toFloat(), h.getDouble("h").toFloat())
                 }
             }
-            Snapshot(list, geo("focus"), geo("anchor"), caret.optBoolean("collapsed", true), offMap, format, counts, hits)
+            val tg = JSONObject(NativeBridge.nativeToggleStates())
+            val toggleMap = HashMap<String, Boolean>()
+            tg.keys().forEach { k -> toggleMap[k] = tg.optBoolean(k) }
+            val ob = JSONObject(NativeBridge.nativeSelectedObject())
+            val obj = if (ob.optBoolean("has")) ObjInfo(
+                ob.getInt("page"), ob.getDouble("x").toFloat(), ob.getDouble("y").toFloat(),
+                ob.getDouble("w").toFloat(), ob.getDouble("h").toFloat(), ob.optBoolean("floating"), ob.optBoolean("picture")
+            ) else null
+            Snapshot(list, geo("focus"), geo("anchor"), caret.optBoolean("collapsed", true), offMap, format, counts, hits, toggleMap, obj)
         }
         pages = snap.pages
         focus = snap.focus
@@ -167,6 +189,8 @@ class EditorState {
         fmt = snap.fmt
         stats = snap.stats
         findHits = snap.hits
+        toggles = snap.toggles
+        selObject = snap.obj
         revision++
     }
 
@@ -202,6 +226,20 @@ class EditorState {
             withContext(Dispatchers.IO) { NativeBridge.nativeHitTest(page, x, y, extend) }
             refreshLocked()
         }
+    }
+
+    /**
+     * A tap on the page: selects a picture or shape if one is under the finger, otherwise puts the
+     * caret there. Returns true when an object was selected.
+     */
+    suspend fun tap(page: Int, x: Float, y: Float): Boolean = gate.withLock {
+        val objectHit = withContext(Dispatchers.IO) {
+            val r = JSONObject(NativeBridge.nativeSelectObjectAt(page, x, y))
+            r.optJSONObject("result")?.optBoolean("hit") ?: false
+        }
+        if (!objectHit) withContext(Dispatchers.IO) { NativeBridge.nativeHitTest(page, x, y, false) }
+        refreshLocked()
+        objectHit
     }
 
     /** Drag the selection's start handle: only the anchor moves. */

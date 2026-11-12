@@ -18,6 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BorderAll
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.ContentPaste
@@ -66,7 +67,8 @@ class HomeActions(
     val run: (String, String) -> Unit,
     val pickFont: () -> Unit,
     val pickSize: () -> Unit,
-    val openFind: (Boolean) -> Unit
+    val openFind: (Boolean) -> Unit,
+    val openBorders: () -> Unit
 )
 
 private val TEXT_COLORS = listOf("000000", "7F7F7F", "C00000", "ED7D31", "FFC000", "548235", "00B0F0", "185ABD", "7030A0", "FF00FF")
@@ -140,7 +142,7 @@ fun HomeTabContent(state: EditorState, actions: HomeActions) {
                     Tool(Icons.Default.FormatListNumbered, "Numbering", false, false) { actions.run("para.numbering", "{}") }
                     Tool(Icons.Default.FormatIndentDecrease, "Decrease indent", false, false) { actions.run("para.outdent", "{}") }
                     Tool(Icons.Default.FormatIndentIncrease, "Increase indent", false, false) { actions.run("para.indent", "{}") }
-                    Tool(null, "¶", false, false) { actions.run("view.marks", "{}") }
+                    Tool(null, "¶", state.toggles["view.marks"] == true, false) { actions.run("view.marks", "{}") }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Tool(Icons.Default.FormatAlignLeft, "Align left", f.align.contains("left") || f.align == "start", false) { actions.run("para.alignLeft", "{}") }
@@ -148,6 +150,7 @@ fun HomeTabContent(state: EditorState, actions: HomeActions) {
                     Tool(Icons.Default.FormatAlignRight, "Align right", f.align.contains("right") || f.align == "end", false) { actions.run("para.alignRight", "{}") }
                     Tool(Icons.Default.FormatAlignJustify, "Justify", f.align.contains("just") || f.align.contains("both"), false) { actions.run("para.justify", "{}") }
                     SpacingMenu { actions.run("para.lineSpacing", "{\"value\":$it}") }
+                    Tool(Icons.Default.BorderAll, "Borders and shading", false, false) { actions.openBorders() }
                 }
             }
         }

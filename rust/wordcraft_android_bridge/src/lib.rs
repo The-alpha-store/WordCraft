@@ -290,7 +290,7 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeRenderPage(
     let Some(page_layout) = usize::try_from(page).ok().and_then(|i| layout.pages.get(i)) else {
         return std::ptr::null_mut();
     };
-    let opts = wordcraft_engine::render::RenderOptions::default();
+    let opts = page_render_options(&current);
     let rendered = wordcraft_engine::render::render_page(&current.doc, page_layout, scale, &opts);
     let mut out = Vec::with_capacity(8 + rendered.pixels.len());
     out.extend_from_slice(&rendered.width.to_le_bytes());
@@ -589,6 +589,114 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeMoveAnchor(
     java_string(&mut env, text)
 }
 
+/// Render options that follow the session's view settings, as the desktop canvas does, so
+/// Show/Hide marks, tracked-change markup and the dark page really change the pages.
+fn page_render_options(s: &Session) -> wordcraft_engine::render::RenderOptions {
+    let mut opts = wordcraft_engine::render::RenderOptions::default();
+    opts.display.marks = s.view.marks;
+    opts.display.always = s.prefs.marks;
+    opts.display.placeholders = true;
+    opts.display.markup = s.view.show_markup;
+    opts.display.revisions = s.prefs.markup.clone();
+    opts.dark = s.view.dark_mode;
+    opts.dark_paper = wordcraft_engine::render::DARK_PAPER;
+    opts
+}
+
+/// On/off state of the toggle commands the ribbon shows as pressed:
+/// `{"view.marks":bool,"view.darkMode":bool,"view.ruler":bool,"view.gridlines":bool,"review.trackChanges":bool}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeToggleStates(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(current) => json!({
+            "view.marks": current.view.marks,
+            "view.darkMode": current.view.dark_mode,
+            "view.ruler": current.view.ruler,
+            "view.gridlines": current.view.gridlines,
+            "review.trackChanges": current.doc.settings.track_changes,
+        })
+        .to_string(),
+        Err(_) => "{}".to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+fn object_json(hit: &wordcraft_engine::layout::hit::ObjectHit, picture: bool) -> Value {
+    json!({
+        "has": true,
+        "page": hit.page,
+        "x": hit.rect.x, "y": hit.rect.y, "w": hit.rect.w, "h": hit.rect.h,
+        "floating": hit.floating(),
+        "picture": picture,
+        "pos": hit.pos(),
+    })
+}
+
+/// The picture or shape currently selected, with its frame in page points:
+/// `{"has":false}` or `{"has":true,"page","x","y","w","h","floating","picture","pos"}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeSelectedObject(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    use wordcraft_engine::doc::para::InlineObject;
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let selected = wordcraft_engine::cmd::objects::selected(&current);
+            match selected {
+                Some((pos, obj)) if !current.sel.is_collapsed() => {
+                    let layout = current.layout();
+                    let picture = matches!(obj, InlineObject::Image { .. });
+                    match layout.object(&pos, 0) {
+                        Some(hit) => object_json(&hit, picture).to_string(),
+                        None => json!({"has": false}).to_string(),
+                    }
+                }
+                _ => json!({"has": false}).to_string(),
+            }
+        }
+        Err(_) => json!({"has": false}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Select the picture or shape under a page point (if any). Returns `{"hit":bool}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeSelectObjectAt(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    page: jint,
+    x: jfloat,
+    y: jfloat,
+) -> jstring {
+    use wordcraft_engine::doc::para::OBJ;
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let layout = current.layout();
+            let story = current.sel.focus.story;
+            let hit = usize::try_from(page).ok().and_then(|i| layout.object_at_in(i, x, y, 6.0, story));
+            match hit {
+                Some(h) if h.member.is_none() && h.text_box.is_none() => {
+                    let start = h.pos();
+                    let mut end = start.clone();
+                    end.off += OBJ.len_utf8();
+                    let params = json!({"anchor": start, "focus": end});
+                    match current.run("select.range", &params) {
+                        Ok(_) => json!({"ok": true, "result": {"hit": true}}).to_string(),
+                        Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
+                    }
+                }
+                _ => json!({"ok": true, "result": {"hit": false}}).to_string(),
+            }
+        }
+        Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
 #[cfg(test)]
 mod tests {
     //! Exercises the exact engine call sequence the JNI functions use (no JVM needed).
@@ -749,5 +857,88 @@ mod tests {
         }
         let r = s.run("layout.margins", &json!({"preset": "narrow"}));
         eprintln!("margins preset: {r:?}");
+    }
+
+    #[test]
+    fn marks_dark_and_picture_selection() {
+        use wordcraft_engine::doc::para::OBJ;
+        let mut s = Session::new(Document::new());
+        s.run("text.insert", &json!({"text": "Hello"})).unwrap();
+        // Show/Hide marks changes the rendered page.
+        let layout = s.layout();
+        let plain = wordcraft_engine::render::render_page(&s.doc, &layout.pages[0], 1.0, &page_render_options(&s));
+        s.run("view.marks", &json!({})).unwrap();
+        assert!(s.view.marks);
+        let layout = s.layout();
+        let marked = wordcraft_engine::render::render_page(&s.doc, &layout.pages[0], 1.0, &page_render_options(&s));
+        assert_ne!(plain.pixels, marked.pixels, "paragraph marks must be drawn");
+        // Dark page.
+        s.run("view.darkMode", &json!({})).unwrap();
+        assert!(page_render_options(&s).dark);
+        s.run("view.darkMode", &json!({})).unwrap();
+        // A picture can be found by point, selected, measured and resized.
+        let png = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAGUlEQVR4nGOUiNrLQApgIkn1qIZRDUNKAwDRKgFPRxr25QAAAABJRU5ErkJggg==";
+        s.run("insert.picture", &json!({"data": png, "width": 120})).unwrap();
+        let (pos, _) = wordcraft_engine::cmd::objects::selected(&s).expect("inserted picture is selected");
+        let layout = s.layout();
+        let hit = layout.object(&pos, 0).expect("picture frame");
+        assert!(hit.rect.w > 20.0 && !hit.floating(), "rect {:?} wrap {:?}", hit.rect, hit.wrap);
+        let (cx, cy) = (hit.rect.x + hit.rect.w / 2.0, hit.rect.y + hit.rect.h / 2.0);
+        s.run("select.range", &json!({"anchor": pos, "focus": pos})).unwrap(); // deselect
+        eprintln!("frame {:?} page {} centre {cx},{cy} story {:?}", hit.rect, hit.page, pos.story);
+        eprintln!("object_at: {:?}", layout.object_at(hit.page, cx, cy, 6.0).map(|h| h.rect));
+        eprintln!("object_at_in: {:?}", layout.object_at_in(hit.page, cx, cy, 6.0, pos.story).map(|h| h.rect));
+        let again = layout.object_at_in(hit.page, cx, cy, 6.0, pos.story).or_else(|| layout.object_at(hit.page, cx, cy, 6.0)).expect("object under point");
+        let mut end = again.pos();
+        end.off += OBJ.len_utf8();
+        s.run("select.range", &json!({"anchor": again.pos(), "focus": end})).unwrap();
+        assert!(wordcraft_engine::cmd::objects::selected(&s).is_some());
+        s.run("picture.size", &json!({"width": 60.0, "height": 40.0, "lockAspect": false})).unwrap();
+        let layout = s.layout();
+        let small = layout.object(&pos, 0).unwrap();
+        assert!((small.rect.w - 60.0).abs() < 1.0 && (small.rect.h - 40.0).abs() < 1.0, "{:?}", small.rect);
+        s.run("arrange.rotation", &json!({"degrees": 90})).unwrap();
+        let r = s.run("picture.border", &json!({"color": "185ABD", "width": 2}));
+        eprintln!("picture.border: {:?}", r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+        let r = s.run("picture.size", &json!({"width": 60.0}));
+        eprintln!("selection still an object: {:?}", wordcraft_engine::cmd::objects::selected(&s).is_some());
+        let _ = r;
+        s.run("picture.altText", &json!({"text": "A pixel"})).unwrap();
+        // Table formatting commands the table sheet uses.
+        s.run("text.newParagraph", &json!({})).unwrap();
+        s.run("insert.table", &json!({"rows": 2, "cols": 2})).unwrap();
+        s.run("table.borders", &json!({"kind": "all", "width": 1.5, "color": "FF0000"})).unwrap();
+        s.run("table.shading", &json!({"color": "FFF2CC"})).unwrap();
+        s.run("table.cellAlign", &json!({"value": "topCenter"})).unwrap();
+        s.run("table.autofit", &json!({"mode": "window"})).unwrap();
+        s.run("table.distributeColumns", &json!({})).unwrap();
+        s.run("table.columnWidth", &json!({"width": 90})).unwrap();
+        for style in ["TableGrid", "PlainTable1", "GridTable1Light", "GridTable4AccentBlue", "GridTable4AccentOrange", "GridTable4AccentGreen", "GridTable4AccentGray", "ListTable3AccentBlue", "GridTable5DarkAccentBlue", "GridTable2AccentBlue", "PlainTable2", "PlainTable3"] {
+            let r = s.run("table.style", &json!({"style": style}));
+            eprintln!("table style {style}: {}", if r.is_ok() { "ok" } else { "ERR" });
+        }
+        s.run("table.look", &json!({"headerRow": true, "bandedRows": true})).unwrap();
+        for kind in ["blank", "sample", "letter", "resume", "report"] {
+            let r = s.run("file.new", &json!({"template": kind}));
+            eprintln!("template {kind}: {}", if r.is_ok() { "ok" } else { "ERR" });
+        }
+    }
+
+    #[test]
+    fn probe_names() {
+        let mut s = Session::new(Document::new());
+        s.run("insert.table", &json!({"rows": 2, "cols": 2})).unwrap();
+        for v in ["topLeft", "topCenter", "topRight", "middleLeft", "centerLeft", "center", "middleCenter", "middleRight", "centerRight", "bottomLeft", "bottomCenter", "bottomRight"] {
+            let r = s.run("table.cellAlign", &json!({"value": v}));
+            eprintln!("cellAlign {v}: {}", if r.is_ok() { "ok" } else { "ERR" });
+        }
+        for v in ["rightDown", "right90", "left90", "flipHorizontal", "flipVertical", "right", "left"] {
+            let r = s.run("arrange.rotate", &json!({"kind": v}));
+            eprintln!("rotate {v}: {:?}", r.map(|_| ()).map_err(|e| e.to_string()));
+        }
+        for v in ["inline", "square", "tight", "through", "topBottom", "behind", "front", "inFront", "inLine"] {
+            let r = s.run("arrange.wrap", &json!({"value": v}));
+            eprintln!("wrap {v}: {:?}", r.map(|_| ()).map_err(|e| e.to_string()));
+        }
     }
 }

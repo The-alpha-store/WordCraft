@@ -55,4 +55,13 @@ object NativeBridge {
 
     /** Move only the selection anchor (drag the start handle). JSON result. */
     external fun nativeMoveAnchor(page: Int, x: Float, y: Float): String
+
+    /** Pressed state of toggle commands (marks, dark page, ruler, gridlines, track changes). */
+    external fun nativeToggleStates(): String
+
+    /** The selected picture/shape and its frame in page points (JSON, {"has":false} if none). */
+    external fun nativeSelectedObject(): String
+
+    /** Select the picture/shape under a page point. JSON result with hit:true/false. */
+    external fun nativeSelectObjectAt(page: Int, x: Float, y: Float): String
 }

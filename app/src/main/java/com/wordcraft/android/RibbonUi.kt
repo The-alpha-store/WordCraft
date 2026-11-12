@@ -131,10 +131,12 @@ private fun RibbonGroupView(state: EditorState, group: RibbonGroup, onInvoke: (R
 @Composable
 private fun RibbonIconButton(state: EditorState, item: RibbonItem, onInvoke: (RibbonItem) -> Unit) {
     val reason = state.disabled[item.id]
+    val on = state.toggles[item.id] == true
     Box(
         Modifier
             .size(46.dp)
             .alpha(if (reason != null) 0.38f else 1f)
+            .background(if (on) Color(0xFFDCE8FA) else Color.Transparent, RoundedCornerShape(10.dp))
             .clickable { if (reason != null) state.status = "${item.label}: $reason" else onInvoke(item) },
         contentAlignment = Alignment.Center
     ) {
@@ -145,13 +147,14 @@ private fun RibbonIconButton(state: EditorState, item: RibbonItem, onInvoke: (Ri
 @Composable
 private fun RibbonTextButton(state: EditorState, item: RibbonItem, onInvoke: (RibbonItem) -> Unit) {
     val reason = state.disabled[item.id]
+    val on = state.toggles[item.id] == true
     Box(
         Modifier
             .widthIn(min = 64.dp, max = 112.dp)
             .height(32.dp)
             .padding(vertical = 1.dp)
             .alpha(if (reason != null) 0.38f else 1f)
-            .background(Color.White, RoundedCornerShape(6.dp))
+            .background(if (on) Color(0xFFDCE8FA) else Color.White, RoundedCornerShape(6.dp))
             .clickable { if (reason != null) state.status = "${item.label}: $reason" else onInvoke(item) }
             .padding(horizontal = 8.dp),
         contentAlignment = Alignment.Center

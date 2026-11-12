@@ -1,7 +1,12 @@
 package com.wordcraft.android
 
 import android.graphics.Bitmap
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -27,6 +32,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.DropdownMenu
@@ -35,6 +41,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -43,7 +50,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
@@ -103,30 +113,62 @@ private fun sizeText(bytes: Long): String = when {
 }
 
 private fun actionIcon(action: String): ImageVector = when {
-    action.contains("PDF", ignoreCase = true) -> Icons.Default.PictureAsPdf
+    action.contains("PDF", ignoreCase = true) || action.contains("Exported", ignoreCase = true) -> Icons.Default.PictureAsPdf
     action.contains("Created", ignoreCase = true) -> Icons.Default.Add
     action.contains("Edited", ignoreCase = true) -> Icons.Default.Edit
     action.contains("Saved", ignoreCase = true) -> Icons.Default.Save
     else -> Icons.Default.FolderOpen
 }
 
+private val TEMPLATES = listOf(
+    "blank" to "Blank", "letter" to "Letter", "resume" to "Resume", "report" to "Report", "sample" to "Sample"
+)
+
+private fun extOf(name: String) = name.substringAfterLast('.', "").lowercase()
+
+private fun badgeColor(ext: String): Color = when (ext) {
+    "doc", "docx" -> Color(0xFF185ABD)
+    "pdf" -> Color(0xFFC62828)
+    "odt" -> Color(0xFFEF6C00)
+    "html", "htm" -> Color(0xFF2E7D32)
+    else -> Color(0xFF667085)
+}
+
 /**
- * The start screen: a greeting, quick ways to begin, then everything recently done: your
- * documents with a first-page preview, and a timeline of what you created, edited and exported.
+ * The start screen: a greeting, a template gallery, then everything recently done: your
+ * documents with first-page previews (pin the ones you keep coming back to), and a timeline of
+ * what you created, edited and exported. Recovery and crash notices appear at the top.
  */
 @Composable
 fun HomeScreen(
     docs: List<RecentDoc>,
     events: List<ActivityEvent>,
     thumb: (String) -> Bitmap?,
-    onNew: () -> Unit,
+    recoveryTitle: String?,
+    crashReport: String?,
+    onRecover: () -> Unit,
+    onDiscardRecovery: () -> Unit,
+    onShareCrash: () -> Unit,
+    onDismissCrash: () -> Unit,
+    onNewTemplate: (String) -> Unit,
     onOpenFile: () -> Unit,
     onOpenRecent: (RecentDoc) -> Unit,
-    onRemove: (RecentDoc) -> Unit
+    onRemove: (RecentDoc) -> Unit,
+    onTogglePin: (RecentDoc) -> Unit,
+    onClearRecent: () -> Unit
 ) {
     var tab by remember { mutableStateOf("Recent") }
+    var filter by remember { mutableStateOf("All") }
     var query by remember { mutableStateOf("") }
-    val shownDocs = docs.filter { query.isBlank() || it.name.contains(query.trim(), ignoreCase = true) }
+    val shownDocs = docs.filter { d ->
+        (query.isBlank() || d.name.contains(query.trim(), ignoreCase = true)) && when (filter) {
+            "Pinned" -> d.pinned
+            "Opened" -> d.action == "Opened"
+            "Saved" -> d.action == "Saved" || d.action == "Edited"
+            "Exported" -> d.action == "Exported"
+            else -> true
+        }
+    }
 
     Column(Modifier.fillMaxSize().background(PageBg).statusBarsPadding().navigationBarsPadding()) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -139,9 +181,35 @@ fun HomeScreen(
             }
         }
 
-        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            ActionCard("Blank document", "Start writing", Icons.Default.Add, primary = true, modifier = Modifier.weight(1f), onClick = onNew)
-            ActionCard("Open", "Browse your files", Icons.Default.FolderOpen, primary = false, modifier = Modifier.weight(1f), onClick = onOpenFile)
+        if (recoveryTitle != null) {
+            Notice(
+                "Recover “$recoveryTitle”?", "The app closed before this document was saved.",
+                "Recover", onRecover, "Discard", onDiscardRecovery
+            )
+        }
+        if (crashReport != null) {
+            Notice(
+                "WordCraft closed unexpectedly", "A report was saved. Sharing it helps fix the problem.",
+                "Share report", onShareCrash, "Dismiss", onDismissCrash
+            )
+        }
+
+        Text("Start a document", Modifier.padding(start = 20.dp, top = 12.dp, bottom = 8.dp), fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF344054))
+        LazyRow(contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            items(TEMPLATES) { (kind, label) -> TemplateTile(kind, label) { onNewTemplate(kind) } }
+            item {
+                Column(
+                    Modifier.width(96.dp).clickable(onClick = onOpenFile),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(
+                        Modifier.size(width = 84.dp, height = 112.dp).background(Color.White, RoundedCornerShape(6.dp))
+                            .border(1.dp, Color(0xFFD5D9E0), RoundedCornerShape(6.dp)),
+                        contentAlignment = Alignment.Center
+                    ) { Icon(Icons.Default.FolderOpen, null, Modifier.size(34.dp), tint = WordBlue) }
+                    Text("Open…", Modifier.padding(top = 6.dp), fontSize = 12.sp)
+                }
+            }
         }
 
         OutlinedTextField(
@@ -149,7 +217,7 @@ fun HomeScreen(
             placeholder = { Text("Search recent documents") },
             leadingIcon = { Icon(Icons.Default.Search, null) },
             shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)
+            modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 14.dp)
         )
 
         Row(Modifier.padding(horizontal = 20.dp, vertical = 12.dp)) {
@@ -167,18 +235,36 @@ fun HomeScreen(
         }
 
         if (tab == "Recent") {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                listOf("All", "Pinned", "Opened", "Saved", "Exported").forEach { f ->
+                    Box(
+                        Modifier
+                            .padding(end = 8.dp, bottom = 6.dp)
+                            .background(if (filter == f) Color(0xFFDCE8FA) else Color.White, RoundedCornerShape(16.dp))
+                            .border(1.dp, if (filter == f) WordBlue else Color(0xFFD5D9E0), RoundedCornerShape(16.dp))
+                            .clickable { filter = f }
+                            .padding(horizontal = 14.dp, vertical = 6.dp)
+                    ) { Text(f, fontSize = 13.sp, color = if (filter == f) WordBlue else Color(0xFF344054)) }
+                }
+                TextButton(onClick = onClearRecent) { Text("Clear", fontSize = 13.sp) }
+            }
             if (shownDocs.isEmpty()) {
-                EmptyState(if (docs.isEmpty()) "No documents yet" else "No matches", if (docs.isEmpty()) "Create a blank document or open a file. It will show up here." else "Try a different name.")
+                EmptyState(if (docs.isEmpty()) "No documents yet" else "Nothing here", if (docs.isEmpty()) "Pick a template above or open a file. It will show up here." else "Try another filter or search.")
             } else {
                 LazyColumn(Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 24.dp)) {
+                    val pinned = if (filter == "All" || filter == "Pinned") shownDocs.filter { it.pinned } else emptyList()
+                    if (pinned.isNotEmpty()) {
+                        item(key = "h_pinned") { SectionHeader("Pinned") }
+                        pinned.forEach { doc -> item(key = "p_" + doc.uri) { RecentRow(doc, thumb(doc.uri), onOpenRecent, onRemove, onTogglePin) } }
+                    }
                     var last = ""
-                    shownDocs.forEach { doc ->
+                    shownDocs.filter { it !in pinned }.forEach { doc ->
                         val b = bucket(doc.openedAt)
                         if (b != last) {
                             last = b
                             item(key = "h_$b") { SectionHeader(b) }
                         }
-                        item(key = doc.uri) { RecentRow(doc, thumb(doc.uri), onOpenRecent, onRemove) }
+                        item(key = doc.uri) { RecentRow(doc, thumb(doc.uri), onOpenRecent, onRemove, onTogglePin) }
                     }
                 }
             }
@@ -217,6 +303,73 @@ fun HomeScreen(
     }
 }
 
+/** A highlighted card with a message and two buttons (recovery, crash report). */
+@Composable
+private fun Notice(title: String, body: String, primary: String, onPrimary: () -> Unit, secondary: String, onSecondary: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)
+            .background(Color(0xFFFFF4D6), RoundedCornerShape(16.dp)).padding(14.dp)
+    ) {
+        Text(title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF5B4300))
+        Text(body, Modifier.padding(top = 2.dp), fontSize = 12.sp, color = Color(0xFF7A5C00))
+        Row(Modifier.padding(top = 6.dp)) {
+            TextButton(onClick = onPrimary) { Text(primary, fontWeight = FontWeight.SemiBold) }
+            TextButton(onClick = onSecondary) { Text(secondary) }
+        }
+    }
+}
+
+@Composable
+private fun TemplateTile(kind: String, label: String, onClick: () -> Unit) {
+    Column(Modifier.width(96.dp).clickable(onClick = onClick), horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            Modifier.size(width = 84.dp, height = 112.dp).background(Color.White, RoundedCornerShape(6.dp))
+                .border(1.dp, Color(0xFFD5D9E0), RoundedCornerShape(6.dp)).padding(8.dp)
+        ) {
+            Canvas(Modifier.fillMaxSize()) { paperLines(kind) }
+        }
+        Text(label, Modifier.padding(top = 6.dp), fontSize = 12.sp)
+    }
+}
+
+/** A tiny sketch of each template's layout. */
+private fun DrawScope.paperLines(kind: String) {
+    val line = Color(0xFFD0D5DD)
+    fun bar(y: Float, w: Float, x: Float = 0f, h: Float = 3.5f, c: Color = line) {
+        drawRect(c, Offset(size.width * x, size.height * y), Size(size.width * w, h))
+    }
+    when (kind) {
+        "letter" -> {
+            bar(0.02f, 0.4f, x = 0.6f); bar(0.08f, 0.3f, x = 0.7f)
+            bar(0.22f, 0.35f); bar(0.28f, 0.45f)
+            bar(0.42f, 0.2f)
+            for (i in 0 until 5) bar(0.52f + i * 0.07f, if (i == 4) 0.5f else 1f)
+            bar(0.9f, 0.3f)
+        }
+        "resume" -> {
+            bar(0.02f, 0.6f, h = 7f, c = WordBlue); bar(0.12f, 0.4f)
+            for (s in 0 until 3) {
+                bar(0.26f + s * 0.24f, 0.35f, c = WordBlue)
+                bar(0.33f + s * 0.24f, 1f); bar(0.39f + s * 0.24f, 0.8f)
+            }
+        }
+        "report" -> {
+            bar(0.04f, 0.8f, h = 8f, c = Color(0xFF0F4761)); bar(0.16f, 0.5f)
+            bar(0.32f, 0.4f, c = Color(0xFF0F4761))
+            for (i in 0 until 3) bar(0.4f + i * 0.07f, if (i == 2) 0.6f else 1f)
+            bar(0.66f, 0.4f, c = Color(0xFF0F4761))
+            for (i in 0 until 3) bar(0.74f + i * 0.07f, if (i == 2) 0.5f else 1f)
+        }
+        "sample" -> {
+            bar(0.04f, 0.7f, h = 7f, c = WordBlue)
+            for (i in 0 until 3) bar(0.2f + i * 0.07f, 1f)
+            drawRect(Color(0xFFDCE8FA), Offset(0f, size.height * 0.5f), Size(size.width, size.height * 0.22f))
+            for (i in 0 until 3) bar(0.78f + i * 0.07f, if (i == 2) 0.4f else 1f)
+        }
+        else -> {}
+    }
+}
+
 @Composable
 private fun ActionCard(title: String, subtitle: String, icon: ImageVector, primary: Boolean, modifier: Modifier, onClick: () -> Unit) {
     Column(
@@ -242,8 +395,11 @@ private fun SectionHeader(text: String) {
 }
 
 @Composable
-private fun RecentRow(doc: RecentDoc, thumb: Bitmap?, onOpen: (RecentDoc) -> Unit, onRemove: (RecentDoc) -> Unit) {
+private fun RecentRow(
+    doc: RecentDoc, thumb: Bitmap?, onOpen: (RecentDoc) -> Unit, onRemove: (RecentDoc) -> Unit, onTogglePin: (RecentDoc) -> Unit
+) {
     var menu by remember { mutableStateOf(false) }
+    val ext = extOf(doc.name)
     Row(
         Modifier.fillMaxWidth().clickable { onOpen(doc) }.padding(horizontal = 20.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -254,17 +410,27 @@ private fun RecentRow(doc: RecentDoc, thumb: Bitmap?, onOpen: (RecentDoc) -> Uni
             contentAlignment = Alignment.Center
         ) {
             if (thumb != null) Image(thumb.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-            else Icon(Icons.Default.Description, null, tint = Color(0xFFB0B7C3))
+            else Box(Modifier.fillMaxSize().background(badgeColor(ext).copy(alpha = 0.10f), RoundedCornerShape(6.dp)), contentAlignment = Alignment.Center) {
+                Text(ext.uppercase().ifBlank { "FILE" }.take(4), fontSize = 13.sp, fontWeight = FontWeight.Bold, color = badgeColor(ext))
+            }
+            Box(
+                Modifier.align(Alignment.BottomStart).padding(3.dp)
+                    .background(badgeColor(ext), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 1.dp)
+            ) { Text(ext.uppercase().ifBlank { "FILE" }.take(4), fontSize = 8.sp, color = Color.White, fontWeight = FontWeight.Bold) }
         }
         Column(Modifier.weight(1f).padding(horizontal = 14.dp)) {
-            Text(doc.name, fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text("${doc.action} ${timeText(doc.openedAt).lowercase().replaceFirstChar { it.uppercase() }}${sizeText(doc.sizeBytes)}",
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(doc.name, Modifier.weight(1f, fill = false), fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (doc.pinned) Icon(Icons.Default.PushPin, "Pinned", Modifier.padding(start = 6.dp).size(15.dp), tint = WordBlue)
+            }
+            Text("${doc.action} · ${timeText(doc.openedAt)}${sizeText(doc.sizeBytes)}",
                 fontSize = 12.sp, color = Color(0xFF667085), maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         Box {
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "More") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 DropdownMenuItem(text = { Text("Open") }, onClick = { menu = false; onOpen(doc) })
+                DropdownMenuItem(text = { Text(if (doc.pinned) "Unpin" else "Pin to top") }, onClick = { menu = false; onTogglePin(doc) })
                 DropdownMenuItem(text = { Text("Remove from list") }, onClick = { menu = false; onRemove(doc) })
             }
         }

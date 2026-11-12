@@ -28,6 +28,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -49,6 +50,9 @@ import org.json.JSONObject
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashLog.install(applicationContext)
+        // "Open with WordCraft": remember the file, but only on a fresh start (not after rotation).
+        incomingUri = if (savedInstanceState == null && intent?.action == Intent.ACTION_VIEW) intent?.data else null
         setContent { WordCraftApp() }
     }
 }
@@ -64,6 +68,15 @@ private class OpenDocumentRW : ActivityResultContracts.OpenDocument() {
         }
 }
 
+/** A document another app asked us to open. */
+private var incomingUri: Uri? = null
+
+/** One editor state for the whole process, so rotating the phone never loses the open document. */
+private val sharedEditorState = EditorState()
+
+/** False in a freshly started process (after the system killed the app), true afterwards. */
+private object ProcessFlag { var alive = false }
+
 private val CONTEXTUAL_TABS = setOf(
     "Table Design", "Table Layout", "Picture Format", "Shape Format", "Chart Design",
     "SmartArt Design", "Equation", "Header & Footer", "Outlining"
@@ -77,17 +90,20 @@ private fun WordCraftApp() {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
     val density = LocalDensity.current
-    val state = remember { EditorState() }
+    val state = sharedEditorState
+    val recovery = remember { RecoveryStore(context) }
     val recents = remember { RecentStore(context) }
     val tabs = remember { RibbonModel.load() }
     val allCommands = remember { RibbonModel.loadAll() }
 
     // --- document session -------------------------------------------------------------
-    var screen by remember { mutableStateOf("home") }
-    var title by remember { mutableStateOf("Document1") }
-    var currentUri by remember { mutableStateOf<Uri?>(null) }
-    var docCounter by remember { mutableIntStateOf(1) }
-    var autoSave by remember { mutableStateOf(false) }
+    var screen by rememberSaveable { mutableStateOf("home") }
+    var title by rememberSaveable { mutableStateOf("Document1") }
+    var currentUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var docCounter by rememberSaveable { mutableStateOf(1) }
+    var autoSave by rememberSaveable { mutableStateOf(false) }
+    var crashReport by remember { mutableStateOf(CrashLog.read(context)) }
+    var recoveryTick by remember { mutableIntStateOf(0) }
     var recentTick by remember { mutableIntStateOf(0) }
     var goHomeAfterSave by remember { mutableStateOf(false) }
 
@@ -108,6 +124,8 @@ private fun WordCraftApp() {
     var showSize by remember { mutableStateOf(false) }
     var showTable by remember { mutableStateOf(false) }
     var showSaveChanges by remember { mutableStateOf(false) }
+    var showTableFormat by remember { mutableStateOf(false) }
+    var showBorders by remember { mutableStateOf(false) }
 
     fun toast(text: String) = Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
 
@@ -116,6 +134,13 @@ private fun WordCraftApp() {
     }
 
     fun baseName() = title.substringBeforeLast('.', title)
+
+    LaunchedEffect(Unit) {
+        if (!ProcessFlag.alive) {
+            ProcessFlag.alive = true
+            screen = "home"
+        }
+    }
 
     // Register the bundled Liberation fonts (Times New Roman / Arial / Courier New metrics) once.
     LaunchedEffect(Unit) {
@@ -178,9 +203,11 @@ private fun WordCraftApp() {
         }.onFailure { toast("Can't open this file: ${it.message}") }
     }
 
-    fun newDocument() {
+    fun newDocument(template: String = "blank") {
         scope.launch {
-            if (state.command("file.new", edits = false)) {
+            val params = JSONObject().put("template", template).toString()
+            if (state.command("file.new", params, edits = false)) {
+                recovery.clear()
                 docCounter += 1
                 title = "Document$docCounter"
                 currentUri = null
@@ -194,6 +221,13 @@ private fun WordCraftApp() {
         }
     }
 
+    LaunchedEffect(Unit) {
+        incomingUri?.let { uri ->
+            incomingUri = null
+            loadDocument(uri)
+        }
+    }
+
     /** Write the document to [uri] as DOCX. Returns true when the write worked. */
     suspend fun writeDocx(uri: Uri, name: String, auto: Boolean): Boolean {
         return runCatching {
@@ -202,6 +236,7 @@ private fun WordCraftApp() {
                 context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(bytes) } ?: error("Could not open the file for writing")
             }
             state.dirty = false
+            recovery.clear()
             recents.touch(uri.toString(), name, bytes.size.toLong(), if (auto) "Edited" else "Saved")
             recentTick++
             if (!auto) state.status = "Saved $name"
@@ -239,8 +274,9 @@ private fun WordCraftApp() {
                 withContext(Dispatchers.IO) {
                     context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(bytes) } ?: error("Could not open the file for writing")
                 }
+                persist(uri)
                 state.status = "Exported $name"
-                recents.log("Exported PDF", name, currentUri?.toString().orEmpty())
+                recents.touch(uri.toString(), name, bytes.size.toLong(), "Exported")
                 recentTick++
             }.onFailure { state.status = "PDF export failed: ${it.message}" }
         }
@@ -284,7 +320,17 @@ private fun WordCraftApp() {
         }
     }
 
+    // Keep a private copy of unsaved work so a crash or a killed app never loses typing.
+    LaunchedEffect(state.revision, state.dirty, screen) {
+        if (screen == "editor" && state.dirty) {
+            delay(2000)
+            state.save("recovery.docx")?.let { recovery.write(title, currentUri?.toString().orEmpty(), it) }
+        }
+    }
+
     fun goHome() {
+        if (!state.dirty) recovery.clear()
+        recoveryTick++
         findOpen = false
         showNav = false; showStyles = false; showFormat = false
         recentTick++
@@ -315,6 +361,20 @@ private fun WordCraftApp() {
             "view.navigationPane" -> showNav = !showNav
             "styles.pane" -> showStyles = !showStyles
             "file.new" -> newDocument()
+            "file.share" -> {
+                val uri = currentUri
+                if (uri == null) state.status = "Save the document first, then share it."
+                else scope.launch {
+                    if (state.dirty) writeDocx(uri, title, auto = false)
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = DOCX_MIME
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    runCatching { context.startActivity(Intent.createChooser(send, "Share document")) }
+                        .onFailure { state.status = "Can't share: ${it.message}" }
+                }
+            }
             "edit.copy", "edit.cut" -> scope.launch {
                 clipboard.setText(AnnotatedString(state.selectedText()))
                 state.command(item.id, edits = item.id == "edit.cut")
@@ -334,8 +394,9 @@ private fun WordCraftApp() {
 
     BackHandler(enabled = screen == "editor") {
         when {
-            showFont || showSize || showTable || showCommands || pendingParams != null -> {
-                showFont = false; showSize = false; showTable = false; showCommands = false; pendingParams = null
+            showFont || showSize || showTable || showCommands || showTableFormat || showBorders || pendingParams != null -> {
+                showFont = false; showSize = false; showTable = false; showCommands = false
+                showTableFormat = false; showBorders = false; pendingParams = null
             }
             findOpen -> findOpen = false
             showNav || showStyles || showFormat -> { showNav = false; showStyles = false; showFormat = false }
@@ -382,11 +443,13 @@ private fun WordCraftApp() {
             cmd("insert.table", JSONObject().put("rows", rows).put("cols", cols).toString())
         })
     }
+    if (showTableFormat) TableFormatSheet(onDismiss = { showTableFormat = false }, onRun = { id, p -> cmd(id, p) })
+    if (showBorders) ParaBorderSheet(onDismiss = { showBorders = false }, onRun = { id, p -> cmd(id, p) })
     if (showSaveChanges) {
         SaveChangesSheet(
             name = title,
             onSave = { showSaveChanges = false; saveDocument(thenHome = true) },
-            onDiscard = { showSaveChanges = false; state.dirty = false; goHome() },
+            onDiscard = { showSaveChanges = false; state.dirty = false; recovery.clear(); goHome() },
             onCancel = { showSaveChanges = false }
         )
     }
@@ -396,14 +459,54 @@ private fun WordCraftApp() {
         val docs = remember(recentTick) { recents.docs() }
         val events = remember(recentTick) { recents.events() }
         val thumbs = remember(recentTick) { HashMap<String, android.graphics.Bitmap?>() }
+        val recoverable = remember(recoveryTick, recentTick) { recovery.read() }
         HomeScreen(
             docs = docs,
             events = events,
             thumb = { uri -> thumbs.getOrPut(uri) { recents.loadThumb(uri) } },
-            onNew = { newDocument() },
+            recoveryTitle = recoverable?.first,
+            crashReport = crashReport,
+            onRecover = {
+                val r = recovery.read()
+                if (r != null) scope.launch {
+                    val name = if (r.first.lowercase().endsWith(".docx")) r.first else r.first + ".docx"
+                    withContext(Dispatchers.IO) { NativeBridge.nativeOpenDocument(name, r.third) }
+                    title = name
+                    currentUri = r.second.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
+                    state.dirty = true
+                    state.refresh()
+                    state.scrollTo(0)
+                    screen = "editor"
+                }
+            },
+            onDiscardRecovery = { recovery.clear(); recoveryTick++ },
+            onShareCrash = {
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "WordCraft crash report")
+                    putExtra(Intent.EXTRA_TEXT, crashReport.orEmpty())
+                }
+                runCatching { context.startActivity(Intent.createChooser(send, "Share crash report")) }
+                CrashLog.clear(context)
+                crashReport = null
+            },
+            onDismissCrash = { CrashLog.clear(context); crashReport = null },
+            onNewTemplate = { kind -> newDocument(kind) },
             onOpenFile = { openDocument.launch(arrayOf("*/*")) },
-            onOpenRecent = { doc -> scope.launch { loadDocument(Uri.parse(doc.uri)) } },
-            onRemove = { doc -> recents.remove(doc.uri); recentTick++ }
+            onOpenRecent = { doc ->
+                val ext = doc.name.substringAfterLast('.', "").lowercase()
+                if (ext == "pdf" || ext == "html" || ext == "htm") {
+                    // Exports open in whichever app handles them.
+                    val view = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(Uri.parse(doc.uri), if (ext == "pdf") "application/pdf" else "text/html")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    runCatching { context.startActivity(view) }.onFailure { toast("No app can open this file") }
+                } else scope.launch { loadDocument(Uri.parse(doc.uri)) }
+            },
+            onRemove = { doc -> recents.remove(doc.uri); recentTick++ },
+            onTogglePin = { doc -> recents.togglePin(doc.uri); recentTick++ },
+            onClearRecent = { recents.clearUnpinned(); recentTick++ }
         )
         return
     }
@@ -417,8 +520,14 @@ private fun WordCraftApp() {
             run = { id, params -> run(id, params) },
             pickFont = { showFont = true },
             pickSize = { showSize = true },
-            openFind = { replace -> openFind(replace) }
+            openFind = { replace -> openFind(replace) },
+            openBorders = { showBorders = true }
         )
+    }
+
+    LaunchedEffect(state.selObject != null) {
+        if (state.selObject?.picture == true) { selectedTab = "Picture Format"; ribbonOpen = true }
+        else if (selectedTab == "Picture Format") selectedTab = "Home"
     }
 
     Column(Modifier.fillMaxSize().background(ChromeGrey).statusBarsPadding().navigationBarsPadding().imePadding()) {
@@ -490,6 +599,7 @@ private fun WordCraftApp() {
             StatusPill(state.status, Modifier.align(Alignment.BottomCenter))
         }
 
+        if (state.inTable && !focusMode) TableBar(onRun = { id, p -> run(id, p) }, onFormat = { showTableFormat = true })
         if (findOpen) FindBar(state, findReplace, onClose = { findOpen = false })
         if (!focusMode) {
             QuickBar(
