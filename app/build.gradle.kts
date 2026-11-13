@@ -17,6 +17,29 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    // Release: shrunk with R8. Signed with the keystore named in WORDCRAFT_KEYSTORE (and its
+    // _PASSWORD, WORDCRAFT_KEY_ALIAS, WORDCRAFT_KEY_PASSWORD) when set, else with the debug key
+    // so a test release still installs.
+    signingConfigs {
+        create("release") {
+            val keystore = System.getenv("WORDCRAFT_KEYSTORE")
+            if (keystore != null) {
+                storeFile = file(keystore)
+                storePassword = System.getenv("WORDCRAFT_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("WORDCRAFT_KEY_ALIAS")
+                keyPassword = System.getenv("WORDCRAFT_KEY_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = if (System.getenv("WORDCRAFT_KEYSTORE") != null) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
+        }
+    }
+
     buildFeatures { compose = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -38,6 +61,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
 }
 
 // Compile the Rust JNI bridge (against the vendored WordCraft engine) before the app builds.

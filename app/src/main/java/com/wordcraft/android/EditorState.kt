@@ -33,8 +33,22 @@ data class FormatState(
     val highlight: Boolean = false,
     val align: String = "left",
     val style: String = "",
-    val list: Boolean = false
+    val list: Boolean = false,
+    val indentLeft: Float = 0f,
+    val indentRight: Float = 0f,
+    val indentFirst: Float = 0f,
+    val tabs: List<Float> = emptyList()
 )
+
+/** A spelling or grammar issue as a rectangle on a page, with the engine's suggestions. */
+data class ProofMark(
+    val page: Int, val x: Float, val top: Float, val w: Float, val h: Float,
+    val kind: String, val message: String, val text: String,
+    val suggestions: List<String>, val start: String, val end: String
+)
+
+/** A comment anchor: where to draw its marker in the margin. */
+data class CommentMark(val id: Int, val page: Int, val top: Float, val h: Float, val resolved: Boolean)
 
 data class DocStats(val words: Int = 0, val chars: Int = 0, val selWords: Int = 0, val selChars: Int = 0)
 
@@ -71,6 +85,26 @@ class EditorState {
 
     /** True when the caret is in a table (the engine enables table commands only there). */
     val inTable: Boolean get() = disabled.isNotEmpty() && disabled["table.insertRowBelow"] == null
+
+    /** Spelling and grammar squiggles, refreshed a moment after typing stops. */
+    var proofing by mutableStateOf(true)
+    var proofMarks by mutableStateOf<List<ProofMark>>(emptyList()); private set
+    var commentMarks by mutableStateOf<List<CommentMark>>(emptyList()); private set
+
+    /** The squiggle the user tapped, shown as a suggestions menu. */
+    var suggestion by mutableStateOf<ProofMark?>(null)
+
+    /** Counts document edits, so slow work (proofing) can wait for typing to pause. */
+    var editCount by mutableIntStateOf(0); private set
+
+    /** Bumped when a margin comment marker is tapped, so the review panel opens. */
+    var reviewRequest by mutableIntStateOf(0)
+
+    /** Ink: the active tool (pen, pencil, highlighter, eraser) or null when not drawing. */
+    var drawTool by mutableStateOf<String?>(null)
+    var drawColor by mutableStateOf("185ABD")
+    var drawWidth by mutableStateOf(2.5f)
+    var stylusOnly by mutableStateOf(false)
 
     /** While true, find matches are highlighted on the pages. */
     var findActive by mutableStateOf(false)
@@ -157,7 +191,13 @@ class EditorState {
                 highlight = f.optBoolean("highlight"),
                 align = f.optString("align", "left"),
                 style = f.optString("style"),
-                list = f.optBoolean("list")
+                list = f.optBoolean("list"),
+                indentLeft = f.optDouble("indentLeft", 0.0).toFloat(),
+                indentRight = f.optDouble("indentRight", 0.0).toFloat(),
+                indentFirst = f.optDouble("indentFirst", 0.0).toFloat(),
+                tabs = f.optJSONArray("tabs")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.optDouble("pos")?.toFloat() }
+                } ?: emptyList()
             )
             val st = JSONObject(NativeBridge.nativeStats())
             val counts = DocStats(st.optInt("words"), st.optInt("chars"), st.optInt("selWords"), st.optInt("selChars"))
@@ -198,6 +238,53 @@ class EditorState {
         gate.withLock { refreshLocked() }
     }
 
+    /** Re-run the spell and grammar check (slow, so callers wait for typing to pause). */
+    suspend fun refreshProof() {
+        if (!proofing) {
+            proofMarks = emptyList()
+            return
+        }
+        val marks = gate.withLock {
+            withContext(Dispatchers.IO) {
+                val arr = JSONObject(NativeBridge.nativeProofMarks()).optJSONArray("marks")
+                val list = ArrayList<ProofMark>()
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val sug = o.optJSONArray("suggestions")
+                    list += ProofMark(
+                        o.getInt("page"), o.getDouble("x").toFloat(), o.getDouble("top").toFloat(),
+                        o.getDouble("w").toFloat(), o.getDouble("h").toFloat(),
+                        o.optString("kind"), o.optString("message"), o.optString("text"),
+                        (0 until (sug?.length() ?: 0)).map { sug!!.getString(it) },
+                        o.getJSONObject("start").toString(), o.getJSONObject("end").toString()
+                    )
+                }
+                list
+            }
+        }
+        proofMarks = marks
+        val cm = gate.withLock {
+            withContext(Dispatchers.IO) {
+                val arr = JSONObject(NativeBridge.nativeCommentMarks()).optJSONArray("marks")
+                (0 until (arr?.length() ?: 0)).map { i ->
+                    val o = arr!!.getJSONObject(i)
+                    CommentMark(o.getInt("id"), o.getInt("page"), o.getDouble("top").toFloat(), o.getDouble("h").toFloat(), o.optBoolean("resolved"))
+                }
+            }
+        }
+        commentMarks = cm
+    }
+
+    /** Select the issue's word. */
+    suspend fun selectIssue(mark: ProofMark): Boolean =
+        command("select.range", JSONObject().put("anchor", JSONObject(mark.start)).put("focus", JSONObject(mark.end)).toString(), edits = false)
+
+    /** Replace a misspelled word with a suggestion. */
+    suspend fun fixIssue(mark: ProofMark, replacement: String) {
+        suggestion = null
+        if (selectIssue(mark)) typeText(replacement)
+    }
+
     /** Run an engine command and return its result object too. */
     suspend fun exec(id: String, params: String = "{}", edits: Boolean = true): CmdResult = gate.withLock {
         val raw = withContext(Dispatchers.IO) { NativeBridge.nativeRunCommand(id, params) }
@@ -212,7 +299,7 @@ class EditorState {
             val shown = result?.toString().orEmpty()
             status = if (shown.length in 3..120 && shown != "{}" && shown != "[]" && result !is JSONObject) shown else ""
         }
-        if (ok && edits) dirty = true
+        if (ok && edits) { dirty = true; editCount++ }
         refreshLocked()
         CmdResult(ok, result)
     }
@@ -263,6 +350,7 @@ class EditorState {
                 }
             }
             dirty = true
+            editCount++
             refreshLocked()
         }
     }
@@ -271,6 +359,7 @@ class EditorState {
         gate.withLock {
             withContext(Dispatchers.IO) { NativeBridge.nativeRunCommand("text.backspace", "{}") }
             dirty = true
+            editCount++
             refreshLocked()
         }
     }

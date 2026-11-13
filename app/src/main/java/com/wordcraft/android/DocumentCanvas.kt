@@ -1,6 +1,18 @@
 package com.wordcraft.android
 
 import androidx.compose.foundation.Canvas
+import org.json.JSONObject
+import org.json.JSONArray
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.Path
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -91,6 +103,8 @@ fun DocumentCanvas(state: EditorState, onCommand: (String, String) -> Unit, modi
     val focusRequester = remember { FocusRequester() }
     val hScroll = rememberScrollState()
     val listState = rememberLazyListState()
+    val canvasScope = rememberCoroutineScope()
+    val rulerOn = state.toggles["view.ruler"] == true
     var caretOn by remember { mutableStateOf(true) }
 
     LaunchedEffect(Unit) { state.refresh() }
@@ -118,7 +132,19 @@ fun DocumentCanvas(state: EditorState, onCommand: (String, String) -> Unit, modi
                         if (event.changes.size >= 2) {
                             val change = event.calculateZoom()
                             if (change != 1f) {
-                                state.zoom = (state.zoom * change).coerceIn(MIN_ZOOM, MAX_ZOOM)
+                                // Zoom about the point between the fingers, so it stays under them.
+                                val centroid = event.calculateCentroid()
+                                val newZoom = (state.zoom * change).coerceIn(MIN_ZOOM, MAX_ZOOM)
+                                val k = newZoom / state.zoom
+                                state.zoom = newZoom
+                                if (k != 1f) {
+                                    val firstItem = listState.layoutInfo.visibleItemsInfo.firstOrNull()
+                                    val itemHeight = (firstItem?.size ?: 0) + 12.dp.toPx()
+                                    val absY = listState.firstVisibleItemIndex * itemHeight + listState.firstVisibleItemScrollOffset
+                                    val dy = (absY + centroid.y) * (k - 1f)
+                                    val dx = (hScroll.value + centroid.x) * (k - 1f)
+                                    canvasScope.launch { listState.scrollBy(dy); hScroll.scrollBy(dx) }
+                                }
                                 event.changes.forEach { it.consume() }
                             }
                         }
@@ -166,7 +192,7 @@ fun DocumentCanvas(state: EditorState, onCommand: (String, String) -> Unit, modi
                 modifier = Modifier.width(contentWidthDp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(vertical = 12.dp)
+                contentPadding = PaddingValues(top = if (rulerOn) 12.dp + RulerHeight else 12.dp, bottom = 12.dp)
             ) {
                 itemsIndexed(state.pages) { index, info ->
                     PageView(
@@ -178,6 +204,15 @@ fun DocumentCanvas(state: EditorState, onCommand: (String, String) -> Unit, modi
                         }
                     )
                 }
+            }
+        }
+
+        if (rulerOn) {
+            val pg = state.pages.getOrNull(state.focus?.page ?: state.visiblePage) ?: state.pages.firstOrNull()
+            if (pg != null) {
+                val contentPx = with(density) { contentWidthDp.toPx() }
+                val pageLeft = (contentPx - pg.w * pxPerPoint) / 2f - hScroll.value
+                Ruler(state, pg, pageLeft, pxPerPoint, Modifier.align(Alignment.TopStart))
             }
         }
 
@@ -198,6 +233,11 @@ private fun PageView(
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     var image by remember { mutableStateOf<ImageBitmap?>(null) }
+    var liveStroke by remember { mutableStateOf<List<Offset>>(emptyList()) }
+    var lastDoubleAt by remember { mutableStateOf(0L) }
+    var lastDoublePos by remember { mutableStateOf(Offset.Zero) }
+    val drawing = state.drawTool != null
+    val tripleSlop = with(density) { 48.dp.toPx() }
 
     // Quantise the scale so pinch-zooming doesn't re-render on every tiny change.
     val renderScale = (pxPerPoint * 20f).roundToInt().coerceAtLeast(1) / 20f
@@ -213,24 +253,57 @@ private fun PageView(
             .size(widthDp, heightDp)
             .shadow(3.dp, RoundedCornerShape(2.dp))
             .background(Color.White)
-            .pointerInput(index, pxPerPoint) {
+            .semantics { contentDescription = "Page ${index + 1}" }
+            .pointerInput(index, pxPerPoint, drawing) {
+                if (drawing) return@pointerInput
                 detectTapGestures(
                     onTap = { offset ->
-                        // A picture or shape under the finger is selected; otherwise the caret moves.
-                        scope.launch { state.tap(index, offset.x / pxPerPoint, offset.y / pxPerPoint) }
+                        val px = offset.x / pxPerPoint
+                        val py = offset.y / pxPerPoint
+                        val now = System.currentTimeMillis()
+                        val triple = now - lastDoubleAt < 900 && (offset - lastDoublePos).getDistance() < tripleSlop
+                        if (triple) {
+                            // Triple tap selects the whole paragraph.
+                            lastDoubleAt = 0L
+                            scope.launch {
+                                state.hit(index, px, py, false)
+                                state.command("select.paragraph", edits = false)
+                            }
+                        } else {
+                            scope.launch {
+                                // A picture or shape under the finger is selected; otherwise the caret moves.
+                                state.tap(index, px, py)
+                                // Tapping a squiggle offers its suggestions.
+                                state.suggestion = state.proofMarks.firstOrNull {
+                                    it.page == index && px >= it.x && px <= it.x + it.w && py >= it.top && py <= it.top + it.h
+                                }
+                            }
+                        }
                         onTouched()
                     },
                     onDoubleTap = { offset ->
-                        // Double tap selects the word, as in Word.
+                        lastDoubleAt = System.currentTimeMillis()
+                        lastDoublePos = offset
+                        val px = offset.x / pxPerPoint
+                        val py = offset.y / pxPerPoint
                         scope.launch {
-                            state.hit(index, offset.x / pxPerPoint, offset.y / pxPerPoint, false)
-                            state.command("select.word", edits = false)
+                            when {
+                                // Double tap in the top or bottom margin edits the header or footer in place.
+                                py < info.by - 4f -> state.command("insert.editHeader", JSONObject().put("page", index).toString(), edits = false)
+                                py > info.by + info.bh + 4f -> state.command("insert.editFooter", JSONObject().put("page", index).toString(), edits = false)
+                                else -> {
+                                    // Double tap selects the word, as in Word.
+                                    state.hit(index, px, py, false)
+                                    state.command("select.word", edits = false)
+                                }
+                            }
                         }
                         onTouched()
                     }
                 )
             }
-            .pointerInput(index, pxPerPoint) {
+            .pointerInput(index, pxPerPoint, drawing) {
+                if (drawing) return@pointerInput
                 detectDragGesturesAfterLongPress(
                     onDragStart = { offset ->
                         scope.launch {
@@ -245,15 +318,84 @@ private fun PageView(
                     }
                 )
             }
+            .pointerInput(drawing, pxPerPoint) {
+                if (!drawing) return@pointerInput
+                // Ink: collect one stroke per touch and hand it to the engine when the finger lifts.
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    if (state.stylusOnly && down.type != PointerType.Stylus) return@awaitEachGesture
+                    val pts = ArrayList<Offset>()
+                    pts.add(down.position)
+                    liveStroke = pts.toList()
+                    down.consume()
+                    val tool = state.drawTool ?: "pen"
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Main)
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!change.pressed) {
+                            change.consume()
+                            break
+                        }
+                        pts.add(change.position)
+                        change.consume()
+                        liveStroke = pts.toList()
+                        if (tool == "eraser" && pts.size % 4 == 0) {
+                            val p = change.position
+                            scope.launch {
+                                state.command("draw.erase", JSONObject().put("page", index).put("x", (p.x / pxPerPoint).toDouble()).put("y", (p.y / pxPerPoint).toDouble()).toString())
+                            }
+                        }
+                    }
+                    val used = state.drawTool
+                    if (used == "eraser") {
+                        val p = pts.last()
+                        scope.launch {
+                            state.command("draw.erase", JSONObject().put("page", index).put("x", (p.x / pxPerPoint).toDouble()).put("y", (p.y / pxPerPoint).toDouble()).toString())
+                        }
+                    } else if (used != null && pts.size >= 2) {
+                        val step = max(1, pts.size / 1500)
+                        val arr = JSONArray()
+                        pts.forEachIndexed { i, p ->
+                            if (i % step == 0 || i == pts.size - 1) {
+                                arr.put(JSONArray().put((p.x / pxPerPoint).toDouble()).put((p.y / pxPerPoint).toDouble()))
+                            }
+                        }
+                        val params = JSONObject().put("page", index).put("points", arr).put("tool", used)
+                            .put("color", state.drawColor).put("width", state.drawWidth.toDouble())
+                        scope.launch { state.command("draw.stroke", params.toString()) }
+                    }
+                    liveStroke = emptyList()
+                }
+            }
     ) {
         Canvas(Modifier.fillMaxSize()) {
             image?.let { drawImage(it, dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt())) }
+            drawProof(state, index, pxPerPoint)
             drawFindHits(state, index, pxPerPoint)
             if (state.selObject == null) drawSelection(state, index, info, pxPerPoint)
-            if (state.collapsed && caretOn) drawCaret(state, index, pxPerPoint)
+            if (state.collapsed && caretOn && !drawing) drawCaret(state, index, pxPerPoint)
+            if (liveStroke.size > 1) drawLiveStroke(liveStroke, state.drawTool, state.drawColor, state.drawWidth * pxPerPoint)
         }
 
-        if (!state.collapsed && state.selObject == null) {
+        // Comment markers in the right margin; tapping one opens the review panel.
+        state.commentMarks.filter { it.page == index }.forEach { m ->
+            val markerPx = with(density) { 22.dp.toPx() }
+            Box(
+                Modifier
+                    .offset {
+                        IntOffset(
+                            ((info.bx + info.bw) * pxPerPoint + 4f).coerceAtMost(info.w * pxPerPoint - markerPx).roundToInt(),
+                            (m.top * pxPerPoint).roundToInt()
+                        )
+                    }
+                    .size(22.dp)
+                    .background(if (m.resolved) Color(0xFFB7C3D9) else Color(0xFFFFC107), RoundedCornerShape(6.dp))
+                    .clickable { state.reviewRequest++ },
+                contentAlignment = Alignment.Center
+            ) { Text("C", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF3B2F00)) }
+        }
+
+        if (!state.collapsed && state.selObject == null && !drawing) {
             val a = state.anchor
             val f = state.focus
             if (a != null && a.page == index) SelectionHandle(state, index, pxPerPoint, isAnchor = true)
@@ -261,6 +403,38 @@ private fun PageView(
             MiniToolbar(state, index, info, pxPerPoint, onCommand)
         }
         if (state.selObject?.page == index) ObjectOverlay(state, index, info, pxPerPoint, onCommand)
+        SuggestionMenu(state, index, pxPerPoint)
+    }
+}
+
+/** The menu that opens when a squiggle is tapped: suggestions, Ignore all, Add to dictionary. */
+@Composable
+private fun SuggestionMenu(state: EditorState, index: Int, ppp: Float) {
+    val m = state.suggestion ?: return
+    if (m.page != index) return
+    val scope = rememberCoroutineScope()
+    Box(Modifier.offset { IntOffset((m.x * ppp).roundToInt(), ((m.top + m.h) * ppp).roundToInt()) }) {
+        DropdownMenu(expanded = true, onDismissRequest = { state.suggestion = null }) {
+            Text(m.message, Modifier.padding(horizontal = 16.dp, vertical = 6.dp), fontSize = 12.sp, color = Color(0xFF667085))
+            m.suggestions.forEach { s ->
+                DropdownMenuItem(text = { Text(s, fontWeight = FontWeight.SemiBold) }, onClick = { scope.launch { state.fixIssue(m, s) } })
+            }
+            DropdownMenuItem(text = { Text("Ignore all") }, onClick = {
+                state.suggestion = null
+                scope.launch {
+                    state.selectIssue(m)
+                    state.command("review.ignoreAll", edits = false)
+                    state.refreshProof()
+                }
+            })
+            DropdownMenuItem(text = { Text("Add to dictionary") }, onClick = {
+                state.suggestion = null
+                scope.launch {
+                    state.command("review.addToDictionary", JSONObject().put("word", m.text).toString(), edits = false)
+                    state.refreshProof()
+                }
+            })
+        }
     }
 }
 
@@ -304,7 +478,7 @@ private fun MiniToolbar(state: EditorState, index: Int, info: PageInfo, ppp: Flo
     val first = if (a.page < f.page || (a.page == f.page && (a.top < f.top || (abs(a.top - f.top) < 1f && a.x <= f.x)))) a else f
     if (first.page != index) return
     val density = LocalDensity.current
-    val widthPx = with(density) { 316.dp.toPx() }
+    val widthPx = with(density) { 330.dp.toPx() }
     val heightPx = with(density) { 44.dp.toPx() }
     val pageW = info.w * ppp
     val x = (first.x * ppp - widthPx / 3f).coerceIn(0f, max(0f, pageW - widthPx))
@@ -319,14 +493,26 @@ private fun MiniToolbar(state: EditorState, index: Int, info: PageInfo, ppp: Flo
             .padding(horizontal = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        MiniButton(commandIcon("edit.cut"), "Cut", false) { onCommand("edit.cut", "{}") }
-        MiniButton(commandIcon("edit.copy"), "Copy", false) { onCommand("edit.copy", "{}") }
-        MiniButton(commandIcon("edit.paste"), "Paste", false) { onCommand("edit.paste", "{}") }
-        Box(Modifier.width(1.dp).size(width = 1.dp, height = 24.dp).background(Color(0xFFDDDDDD)))
-        MiniButton(Icons.Default.FormatBold, "Bold", fmt.bold) { onCommand("format.bold", "{}") }
-        MiniButton(Icons.Default.FormatItalic, "Italic", fmt.italic) { onCommand("format.italic", "{}") }
-        MiniButton(Icons.Default.FormatUnderlined, "Underline", fmt.underline) { onCommand("format.underline", "{}") }
-        MiniButton(commandIcon("format.highlight"), "Highlight", fmt.highlight) { onCommand("format.highlight", "{\"color\":\"FFFF00\"}") }
+        Row(Modifier.widthIn(max = 326.dp).horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+            MiniButton(commandIcon("edit.cut"), "Cut", false) { onCommand("edit.cut", "{}") }
+            MiniButton(commandIcon("edit.copy"), "Copy", false) { onCommand("edit.copy", "{}") }
+            MiniButton(commandIcon("edit.paste"), "Paste", false) { onCommand("edit.paste", "{}") }
+            Box(Modifier.size(width = 1.dp, height = 24.dp).background(Color(0xFFDDDDDD)))
+            MiniButton(Icons.Default.FormatBold, "Bold", fmt.bold) { onCommand("format.bold", "{}") }
+            MiniButton(Icons.Default.FormatItalic, "Italic", fmt.italic) { onCommand("format.italic", "{}") }
+            MiniButton(Icons.Default.FormatUnderlined, "Underline", fmt.underline) { onCommand("format.underline", "{}") }
+            MiniButton(commandIcon("format.highlight"), "Highlight", fmt.highlight) { onCommand("format.highlight", "{\"color\":\"FFFF00\"}") }
+            Box(Modifier.size(width = 1.dp, height = 24.dp).background(Color(0xFFDDDDDD)))
+            MiniText("Select all") { onCommand("select.all", "{}") }
+            MiniText("Look up") { onCommand("app.lookup", "{}") }
+        }
+    }
+}
+
+@Composable
+private fun MiniText(label: String, onClick: () -> Unit) {
+    Box(Modifier.padding(horizontal = 2.dp).clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 10.dp)) {
+        Text(label, fontSize = 13.sp, color = Color(0xFF242424), maxLines = 1)
     }
 }
 
@@ -537,7 +723,7 @@ private fun ObjectOverlay(state: EditorState, index: Int, info: PageInfo, ppp: F
     }
 
     // Toolbar above (or below) the frame.
-    val toolbarWidthPx = with(density) { 340.dp.toPx() }
+    val toolbarWidthPx = with(density) { 320.dp.toPx() }
     val pageW = info.w * ppp
     val tx = (frame.x * ppp).coerceIn(0f, max(0f, pageW - toolbarWidthPx))
     val above = frame.y * ppp - with(density) { 52.dp.toPx() }
@@ -554,7 +740,7 @@ private fun ObjectOverlay(state: EditorState, index: Int, info: PageInfo, ppp: F
             "Wrap" to "arrange.wrap", "Rotate" to "arrange.rotate", "Size" to "picture.size", "Border" to "picture.border",
             "Alt text" to "picture.altText", "Reset" to "picture.reset", "Delete" to "text.backspace"
         ) else listOf("Wrap" to "arrange.wrap", "Rotate" to "arrange.rotate", "Delete" to "text.backspace")
-        Row(Modifier.widthIn(max = 340.dp).horizontalScroll(rememberScrollState())) {
+        Row(Modifier.widthIn(max = 320.dp).horizontalScroll(rememberScrollState())) {
             items.forEach { (label, id) ->
                 Box(
                     Modifier.padding(horizontal = 2.dp)
@@ -565,4 +751,43 @@ private fun ObjectOverlay(state: EditorState, index: Int, info: PageInfo, ppp: F
             }
         }
     }
+}
+
+/** Wavy underlines: red for spelling, blue for grammar and style. */
+private fun DrawScope.drawProof(state: EditorState, index: Int, ppp: Float) {
+    if (!state.proofing) return
+    for (m in state.proofMarks) {
+        if (m.page != index) continue
+        val color = when (m.kind) {
+            "spelling" -> Color(0xFFD32F2F)
+            "grammar" -> Color(0xFF1E5AA8)
+            else -> Color(0xFF7B1FA2)
+        }
+        val y = (m.top + m.h) * ppp - 1f
+        var x = m.x * ppp
+        val end = (m.x + m.w) * ppp
+        val path = Path()
+        path.moveTo(x, y)
+        var up = true
+        while (x < end) {
+            x = minOf(x + 3f, end)
+            path.lineTo(x, if (up) y - 2.4f else y)
+            up = !up
+        }
+        drawPath(path, color, style = Stroke(width = 1.7f))
+    }
+}
+
+/** The stroke being drawn right now, before the engine has it. */
+private fun DrawScope.drawLiveStroke(points: List<Offset>, tool: String?, colorHex: String, widthPx: Float) {
+    if (tool == "eraser") {
+        drawCircle(Color(0x55000000), radius = 14f, center = points.last())
+        return
+    }
+    val path = Path()
+    path.moveTo(points.first().x, points.first().y)
+    for (i in 1 until points.size) path.lineTo(points[i].x, points[i].y)
+    val base = Color(("FF$colorHex").toLong(16))
+    val color = if (tool == "highlighter") base.copy(alpha = 0.4f) else base
+    drawPath(path, color, style = Stroke(width = maxOf(widthPx, 2f), cap = androidx.compose.ui.graphics.StrokeCap.Round))
 }

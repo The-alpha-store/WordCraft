@@ -59,6 +59,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -360,5 +361,53 @@ fun SaveChangesSheet(name: String, onSave: () -> Unit, onDiscard: () -> Unit, on
             onClick = onDiscard, modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(50.dp), shape = RoundedCornerShape(14.dp)
         ) { Text("Don't save", fontSize = 16.sp, color = Color(0xFFB42318)) }
         TextButton(onClick = onCancel, modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) { Text("Cancel") }
+    }
+}
+
+/** Document themes (colours, fonts, effects) as a list to pick from. */
+@Composable
+fun ThemesSheet(onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    val names = remember {
+        runCatching {
+            val result = org.json.JSONObject(NativeBridge.nativeRunCommand("design.themes", "{}")).opt("result")
+            val arr = result as? org.json.JSONArray
+            (0 until (arr?.length() ?: 0)).map { i ->
+                val v = arr!!.get(i)
+                if (v is org.json.JSONObject) v.optString("name") else v.toString()
+            }.filter { it.isNotBlank() }
+        }.getOrDefault(emptyList())
+    }
+    AppSheet(onDismiss) {
+        SheetTitle("Themes", "Colours, fonts and effects for the whole document")
+        LazyColumn(Modifier.height(320.dp)) {
+            items(names) { name ->
+                Text(
+                    name, Modifier.fillMaxWidth().clickable { onPick(name) }.padding(vertical = 14.dp),
+                    fontSize = 17.sp
+                )
+                HorizontalDivider(color = Color(0xFFF0F0F0))
+            }
+        }
+    }
+}
+
+/** Asks for a document's password, and says so when the last attempt was wrong. */
+@Composable
+fun PasswordSheet(name: String, wrong: Boolean, onSubmit: (String) -> Unit, onCancel: () -> Unit) {
+    var password by remember { mutableStateOf("") }
+    AppSheet(onCancel) {
+        SheetTitle("Password needed", name)
+        if (wrong) Text("That password isn't right. Try again.", Modifier.padding(bottom = 8.dp), fontSize = 13.sp, color = Color(0xFFB42318))
+        OutlinedTextField(
+            value = password, onValueChange = { password = it }, singleLine = true, label = { Text("Password") },
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Button(
+            onClick = { onSubmit(password) }, enabled = password.isNotEmpty(),
+            modifier = Modifier.fillMaxWidth().padding(top = 14.dp).height(50.dp), shape = RoundedCornerShape(14.dp)
+        ) { Text("Open", fontSize = 16.sp) }
+        TextButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
     }
 }

@@ -1,6 +1,30 @@
 package com.wordcraft.android
 
 import android.content.Context
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.DisposableEffect
+import java.io.File
+import androidx.core.content.FileProvider
+import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.TextToSpeech
+import android.app.SearchManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -77,6 +101,9 @@ private val sharedEditorState = EditorState()
 /** False in a freshly started process (after the system killed the app), true afterwards. */
 private object ProcessFlag { var alive = false }
 
+/** A document that needs its password before it can open. */
+private class PendingOpen(val uri: Uri, val name: String, val bytes: ByteArray, val wrong: Boolean)
+
 private val CONTEXTUAL_TABS = setOf(
     "Table Design", "Table Layout", "Picture Format", "Shape Format", "Chart Design",
     "SmartArt Design", "Equation", "Header & Footer", "Outlining"
@@ -126,6 +153,12 @@ private fun WordCraftApp() {
     var showSaveChanges by remember { mutableStateOf(false) }
     var showTableFormat by remember { mutableStateOf(false) }
     var showBorders by remember { mutableStateOf(false) }
+    var showReview by remember { mutableStateOf(false) }
+    var reviewTab by remember { mutableStateOf("Changes") }
+    var showThemes by remember { mutableStateOf(false) }
+    var pendingOpen by remember { mutableStateOf<PendingOpen?>(null) }
+    var reading by remember { mutableStateOf(false) }
+    val tts = remember { mutableStateOf<TextToSpeech?>(null) }
 
     fun toast(text: String) = Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
 
@@ -181,6 +214,25 @@ private fun WordCraftApp() {
         state.renderPage(0, 0.32f)?.let { recents.saveThumb(uri, it) }
     }
 
+    suspend fun completeOpen(uri: Uri, name: String, bytes: ByteArray, result: String) {
+        if (result == "PASSWORD_REQUIRED" || result == "WRONG_PASSWORD") {
+            pendingOpen = PendingOpen(uri, name, bytes, result == "WRONG_PASSWORD")
+            return
+        }
+        pendingOpen = null
+        title = name
+        currentUri = uri
+        state.dirty = false
+        state.refresh()
+        state.scrollTo(0)
+        screen = "editor"
+        if (result.contains("\"ok\":false") || result.startsWith("Could not")) state.status = result.take(160)
+        recents.touch(uri.toString(), name, bytes.size.toLong(), "Opened")
+        recentTick++
+        updateThumb(uri.toString())
+        recentTick++
+    }
+
     suspend fun loadDocument(uri: Uri) {
         runCatching {
             persist(uri)
@@ -189,17 +241,7 @@ private fun WordCraftApp() {
             }
             val (name, _) = queryInfo(uri)
             val result = withContext(Dispatchers.IO) { NativeBridge.nativeOpenDocument(name, bytes) }
-            title = name
-            currentUri = uri
-            state.dirty = false
-            state.refresh()
-            state.scrollTo(0)
-            screen = "editor"
-            if (result.contains("\"ok\":false") || result.contains("error", ignoreCase = true)) state.status = result.take(160)
-            recents.touch(uri.toString(), name, bytes.size.toLong(), "Opened")
-            recentTick++
-            updateThumb(uri.toString())
-            recentTick++
+            completeOpen(uri, name, bytes, result)
         }.onFailure { toast("Can't open this file: ${it.message}") }
     }
 
@@ -282,6 +324,22 @@ private fun WordCraftApp() {
         }
     }
 
+    val createCopy = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument(DOCX_MIME)) { uri: Uri? ->
+        if (uri != null) scope.launch {
+            runCatching {
+                val (name, _) = queryInfo(uri)
+                val bytes = state.save(name) ?: error("The engine could not export the document")
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(bytes) } ?: error("Could not open the file for writing")
+                }
+                persist(uri)
+                state.status = "Saved a copy as $name"
+                recents.touch(uri.toString(), name, bytes.size.toLong(), "Saved")
+                recentTick++
+            }.onFailure { state.status = "Save a copy failed: ${it.message}" }
+        }
+    }
+
     val pickPicture = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) scope.launch {
             runCatching {
@@ -317,6 +375,75 @@ private fun WordCraftApp() {
         if (screen == "editor" && autoSave && state.dirty && uri != null && title.lowercase().endsWith(".docx")) {
             delay(2500)
             writeDocx(uri, title, auto = true)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        val engine = TextToSpeech(context) { }
+        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) { if (utteranceId == "wcLast") reading = false }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) { reading = false }
+        })
+        tts.value = engine
+        onDispose { engine.stop(); engine.shutdown() }
+    }
+
+    fun stopReading() {
+        tts.value?.stop()
+        reading = false
+    }
+
+    fun readAloud() {
+        val engine = tts.value ?: run { state.status = "Read aloud isn't available on this device."; return }
+        scope.launch {
+            val selected = state.selectedText()
+            val text = if (selected.isNotBlank()) selected else withContext(Dispatchers.IO) { NativeBridge.nativeDocumentText() }
+            if (text.isBlank()) { state.status = "Nothing to read yet."; return@launch }
+            val chunks = text.chunked(3500)
+            engine.stop()
+            chunks.forEachIndexed { i, chunk ->
+                val last = i == chunks.size - 1
+                engine.speak(chunk, if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, if (last) "wcLast" else "wc$i")
+            }
+            reading = true
+            state.status = "Reading aloud… tap ⋮ then Stop reading"
+        }
+    }
+
+    /** Export the document to a private cache file and open Android's share sheet. */
+    fun shareExport(fileName: String, mime: String) {
+        scope.launch {
+            runCatching {
+                val bytes = state.save(fileName) ?: error("The engine could not export the document")
+                val dir = File(context.cacheDir, "share").apply { mkdirs() }
+                val file = File(dir, fileName)
+                withContext(Dispatchers.IO) { file.writeBytes(bytes) }
+                val uri = FileProvider.getUriForFile(context, context.packageName + ".files", file)
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = mime
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(send, "Share"))
+            }.onFailure { state.status = "Can't share: ${it.message}" }
+        }
+    }
+
+    // Spelling and grammar squiggles refresh when typing pauses.
+    LaunchedEffect(state.editCount, state.proofing, screen, title) {
+        if (screen == "editor") {
+            delay(900)
+            state.refreshProof()
+        }
+    }
+
+    // Open the review panel on Comments when a margin marker is tapped.
+    LaunchedEffect(state.reviewRequest) {
+        if (state.reviewRequest > 0) {
+            reviewTab = "Comments"
+            showReview = true
         }
     }
 
@@ -361,20 +488,25 @@ private fun WordCraftApp() {
             "view.navigationPane" -> showNav = !showNav
             "styles.pane" -> showStyles = !showStyles
             "file.new" -> newDocument()
-            "file.share" -> {
-                val uri = currentUri
-                if (uri == null) state.status = "Save the document first, then share it."
-                else scope.launch {
-                    if (state.dirty) writeDocx(uri, title, auto = false)
-                    val send = Intent(Intent.ACTION_SEND).apply {
-                        type = DOCX_MIME
-                        putExtra(Intent.EXTRA_STREAM, uri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-                    runCatching { context.startActivity(Intent.createChooser(send, "Share document")) }
-                        .onFailure { state.status = "Can't share: ${it.message}" }
+            "file.share" -> shareExport(baseName() + ".docx", DOCX_MIME)
+            "file.sharePdf" -> shareExport(baseName() + ".pdf", "application/pdf")
+            "file.saveCopy" -> createCopy.launch(baseName() + " copy.docx")
+            "review.readAloud", "app.read" -> if (reading) stopReading() else readAloud()
+            "app.proofing" -> { state.proofing = !state.proofing; scope.launch { state.refreshProof() } }
+            "app.autosave" -> {
+                autoSave = !autoSave
+                if (autoSave && currentUri == null) state.status = "AutoSave starts once the document has been saved to a file."
+            }
+            "app.focus" -> focusMode = !focusMode
+            "app.review" -> { reviewTab = "Changes"; showReview = !showReview }
+            "app.lookup" -> scope.launch {
+                val q = state.selectedText().trim()
+                if (q.isNotEmpty()) {
+                    val search = Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, q.take(120))
+                    runCatching { context.startActivity(search) }.onFailure { state.status = "No app can look this up." }
                 }
             }
+            "design.theme", "design.themes" -> showThemes = true
             "edit.copy", "edit.cut" -> scope.launch {
                 clipboard.setText(AnnotatedString(state.selectedText()))
                 state.command(item.id, edits = item.id == "edit.cut")
@@ -394,7 +526,8 @@ private fun WordCraftApp() {
 
     BackHandler(enabled = screen == "editor") {
         when {
-            showFont || showSize || showTable || showCommands || showTableFormat || showBorders || pendingParams != null -> {
+            showFont || showSize || showTable || showCommands || showTableFormat || showBorders || showThemes || pendingOpen != null || pendingParams != null -> {
+                showThemes = false; pendingOpen = null
                 showFont = false; showSize = false; showTable = false; showCommands = false
                 showTableFormat = false; showBorders = false; pendingParams = null
             }
@@ -443,6 +576,22 @@ private fun WordCraftApp() {
             cmd("insert.table", JSONObject().put("rows", rows).put("cols", cols).toString())
         })
     }
+    pendingOpen?.let { p ->
+        PasswordSheet(
+            name = p.name, wrong = p.wrong,
+            onSubmit = { pw ->
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) { NativeBridge.nativeOpenDocumentWithPassword(p.name, p.bytes, pw) }
+                    completeOpen(p.uri, p.name, p.bytes, result)
+                }
+            },
+            onCancel = { pendingOpen = null }
+        )
+    }
+    if (showThemes) ThemesSheet(onDismiss = { showThemes = false }, onPick = { name ->
+        showThemes = false
+        cmd("design.theme", JSONObject().put("name", name).toString())
+    })
     if (showTableFormat) TableFormatSheet(onDismiss = { showTableFormat = false }, onRun = { id, p -> cmd(id, p) })
     if (showBorders) ParaBorderSheet(onDismiss = { showBorders = false }, onRun = { id, p -> cmd(id, p) })
     if (showSaveChanges) {
@@ -530,14 +679,89 @@ private fun WordCraftApp() {
         else if (selectedTab == "Picture Format") selectedTab = "Home"
     }
 
-    Column(Modifier.fillMaxSize().background(ChromeGrey).statusBarsPadding().navigationBarsPadding().imePadding()) {
+    LaunchedEffect(selectedTab) { if (selectedTab != "Draw") state.drawTool = null }
+
+    // Hardware keyboard: Word's shortcuts and caret movement.
+    fun handleKey(e: KeyEvent): Boolean {
+        if (e.type != KeyEventType.KeyDown) return false
+        val ctrl = e.isCtrlPressed || e.isMetaPressed
+        val extend = "{\"extend\":${e.isShiftPressed}}"
+        // While a text box (find, review, navigation) has focus, leave its own keys alone.
+        val typingElsewhere = findOpen || showReview || showNav
+        if (typingElsewhere && !(ctrl && (e.key == Key.F || e.key == Key.H || e.key == Key.S))) return false
+        return if (ctrl) when (e.key) {
+            Key.B -> { run("format.bold", "{}"); true }
+            Key.I -> { run("format.italic", "{}"); true }
+            Key.U -> { run("format.underline", "{}"); true }
+            Key.Z -> { run(if (e.isShiftPressed) "edit.redo" else "edit.undo", "{}"); true }
+            Key.Y -> { run("edit.redo", "{}"); true }
+            Key.S -> { saveDocument(); true }
+            Key.F -> { openFind(false); true }
+            Key.H -> { openFind(true); true }
+            Key.A -> { run("select.all", "{}"); true }
+            Key.C -> { run("edit.copy", "{}"); true }
+            Key.X -> { run("edit.cut", "{}"); true }
+            Key.V -> { run("edit.paste", "{}"); true }
+            Key.E -> { run("para.alignCenter", "{}"); true }
+            Key.L -> { run("para.alignLeft", "{}"); true }
+            Key.R -> { run("para.alignRight", "{}"); true }
+            Key.J -> { run("para.justify", "{}"); true }
+            Key.P -> { createPdf.launch(baseName() + ".pdf"); true }
+            Key.N -> { newDocument(); true }
+            Key.O -> { openDocument.launch(arrayOf("*/*")); true }
+            Key.DirectionLeft -> { cmd("caret.wordLeft", extend, false); true }
+            Key.DirectionRight -> { cmd("caret.wordRight", extend, false); true }
+            Key.DirectionUp -> { cmd("caret.paraUp", extend, false); true }
+            Key.DirectionDown -> { cmd("caret.paraDown", extend, false); true }
+            Key.MoveHome -> { cmd("caret.docStart", extend, false); true }
+            Key.MoveEnd -> { cmd("caret.docEnd", extend, false); true }
+            Key.Backspace -> { cmd("text.deleteWordBack"); true }
+            Key.Delete -> { cmd("text.deleteWordForward"); true }
+            else -> false
+        } else when (e.key) {
+            Key.DirectionLeft -> { cmd("caret.left", extend, false); true }
+            Key.DirectionRight -> { cmd("caret.right", extend, false); true }
+            Key.DirectionUp -> { cmd("caret.up", extend, false); true }
+            Key.DirectionDown -> { cmd("caret.down", extend, false); true }
+            Key.MoveHome -> { cmd("caret.home", extend, false); true }
+            Key.MoveEnd -> { cmd("caret.end", extend, false); true }
+            Key.PageUp -> { cmd("caret.pageUp", extend, false); true }
+            Key.PageDown -> { cmd("caret.pageDown", extend, false); true }
+            Key.Delete -> { cmd("text.delete"); true }
+            else -> false
+        }
+    }
+
+    val menuItems = listOf(
+        "New" to "file.new",
+        "Open…" to "file.open",
+        "Save as DOCX…" to "file.saveAs",
+        "Save a copy…" to "file.saveCopy",
+        "Export PDF…" to "file.exportPdf",
+        "Share…" to "file.share",
+        "Share as PDF…" to "file.sharePdf",
+        "Review pane" to "app.review",
+        (if (state.proofing) "Spell check: On" else "Spell check: Off") to "app.proofing",
+        (if (state.toggles["view.ruler"] == true) "Ruler: On" else "Ruler: Off") to "view.ruler",
+        (if (state.toggles["view.darkMode"] == true) "Dark page: On" else "Dark page: Off") to "view.darkMode",
+        (if (reading) "Stop reading" else "Read aloud") to "app.read",
+        (if (autoSave) "AutoSave: On" else "AutoSave: Off") to "app.autosave",
+        (if (focusMode) "Exit focus mode" else "Focus mode") to "app.focus",
+        "Encrypt with password…" to "file.encrypt",
+        "Fit page to screen" to "view.pageWidth"
+    )
+
+    Column(
+        Modifier.fillMaxSize().background(ChromeGrey).statusBarsPadding().navigationBarsPadding().imePadding()
+            .onPreviewKeyEvent { handleKey(it) }
+    ) {
         WordTitleBar(
             title = title,
             saved = !state.dirty,
             autoSave = autoSave,
             canUndo = state.disabled["edit.undo"] == null,
             canRedo = state.disabled["edit.redo"] == null,
-            focusMode = focusMode,
+            menuItems = menuItems,
             onHome = {
                 if (state.dirty) showSaveChanges = true else goHome()
             },
@@ -545,12 +769,7 @@ private fun WordCraftApp() {
             onUndo = { cmd("edit.undo") },
             onRedo = { cmd("edit.redo") },
             onSearch = { showCommands = true },
-            onToggleAutoSave = {
-                autoSave = !autoSave
-                if (autoSave && currentUri == null) state.status = "AutoSave starts once the document has been saved to a file."
-            },
-            onToggleFocus = { focusMode = !focusMode },
-            onMenuItem = { id -> invoke(RibbonItem("", "", id, id, "{}", "")) }
+            onMenuItem = { id -> invoke(allCommands.firstOrNull { it.id == id } ?: RibbonItem("", "", id, id, "{}", "")) }
         )
 
         if (!focusMode) {
@@ -565,13 +784,16 @@ private fun WordCraftApp() {
                 onToggle = { ribbonOpen = !ribbonOpen }
             )
             AnimatedVisibility(visible = ribbonOpen) {
-                if (activeTab?.name == "Home") {
-                    Column(Modifier.fillMaxWidth().background(Color(0xFFFBFBFB))) {
+                when (activeTab?.name) {
+                    "Home" -> Column(Modifier.fillMaxWidth().background(Color(0xFFFBFBFB))) {
                         HomeTabContent(state, homeActions)
                         HorizontalDivider(color = Color(0xFFE1E1E1))
                     }
-                } else {
-                    RibbonBody(state, activeTab, onInvoke = { invoke(it) })
+                    "Draw" -> Column(Modifier.fillMaxWidth().background(Color(0xFFFBFBFB))) {
+                        DrawTabContent(state)
+                        HorizontalDivider(color = Color(0xFFE1E1E1))
+                    }
+                    else -> RibbonBody(state, activeTab, onInvoke = { invoke(it) })
                 }
             }
         }
@@ -579,9 +801,35 @@ private fun WordCraftApp() {
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
             val boundsW = with(density) { maxWidth.toPx() }
             val boundsH = with(density) { maxHeight.toPx() }
-            DocumentCanvas(state, onCommand = { id, params -> run(id, params) }, modifier = Modifier.fillMaxSize())
+            // On tablets and unfolded foldables the Navigation pane docks beside the page.
+            val docked = maxWidth >= 840.dp
 
-            if (showNav) {
+            Row(Modifier.fillMaxSize()) {
+                if (docked && showNav) {
+                    Column(Modifier.width(320.dp).fillMaxHeight().background(Color.White).padding(10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Navigation", Modifier.weight(1f), fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Close", Modifier.clickable { showNav = false }.padding(8.dp), fontSize = 13.sp, color = WordBlue)
+                        }
+                        NavigationPanelContent(state)
+                    }
+                }
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    DocumentCanvas(state, onCommand = { id, params -> run(id, params) }, modifier = Modifier.fillMaxSize())
+                    // While a header or footer is being edited, one tap gets back to the page.
+                    if (state.disabled.isNotEmpty() && state.disabled["insert.closeHeader"] == null) {
+                        Box(
+                            Modifier.align(Alignment.TopCenter).padding(top = 8.dp)
+                                .background(WordBlue, RoundedCornerShape(20.dp))
+                                .clickable { cmd("insert.closeHeader", "{}", false) }
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                        ) { Text("Close header & footer", color = Color.White, fontSize = 13.sp) }
+                    }
+                    StatusPill(state.status, Modifier.align(Alignment.BottomCenter))
+                }
+            }
+
+            if (showNav && !docked) {
                 FloatingPanel("Navigation", boundsW, boundsH, Offset(boundsW * 0.04f, 24f), onClose = { showNav = false }, bodyHeight = 380.dp) {
                     NavigationPanelContent(state)
                 }
@@ -596,7 +844,11 @@ private fun WordCraftApp() {
                     FormatPanelContent(onPickFont = { showFont = true }) { id, params -> run(id, params) }
                 }
             }
-            StatusPill(state.status, Modifier.align(Alignment.BottomCenter))
+            if (showReview) {
+                FloatingPanel("Review", boundsW, boundsH, Offset(boundsW * 0.06f, 40f), onClose = { showReview = false }, bodyHeight = 400.dp) {
+                    ReviewPanelContent(state, reviewTab) { id, params -> run(id, params) }
+                }
+            }
         }
 
         if (state.inTable && !focusMode) TableBar(onRun = { id, p -> run(id, p) }, onFormat = { showTableFormat = true })

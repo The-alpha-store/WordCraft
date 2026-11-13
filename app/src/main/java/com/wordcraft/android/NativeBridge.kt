@@ -64,4 +64,16 @@ object NativeBridge {
 
     /** Select the picture/shape under a page point. JSON result with hit:true/false. */
     external fun nativeSelectObjectAt(page: Int, x: Float, y: Float): String
+
+    /** Open a password-protected document. Returns PASSWORD_REQUIRED / WRONG_PASSWORD or a status line. */
+    external fun nativeOpenDocumentWithPassword(name: String, bytes: ByteArray, password: String): String
+
+    /** Spelling and grammar marks as page rectangles with suggestions (JSON). */
+    external fun nativeProofMarks(): String
+
+    /** Where comments are anchored on the pages (JSON). */
+    external fun nativeCommentMarks(): String
+
+    /** The body's plain text, for Read Aloud. */
+    external fun nativeDocumentText(): String
 }

@@ -193,16 +193,7 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeOpenDocumen
         Ok(value) => value,
         Err(error) => return java_string(&mut env, format!("Could not read document bytes: {error}")),
     };
-    let result = match wordcraft_engine::io::open_bytes(&name, &bytes) {
-        Ok(document) => match session().lock() {
-            Ok(mut current) => {
-                current.set_document(document);
-                format!("Opened {name} with WordCraft 0.16.0")
-            }
-            Err(_) => "WordCraft engine session lock failed".to_owned(),
-        },
-        Err(error) => format!("Could not open {name}: {error}"),
-    };
+    let result = open_into_session(&name, &bytes, None);
     java_string(&mut env, result)
 }
 
@@ -478,6 +469,7 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeFormatState
             let pstyle = para.and_then(|p| p.props.style.clone());
             let rc = s.doc.styles.resolve_char(pstyle.as_deref(), &cp);
             let rp = para.map(|p| s.doc.styles.resolve_para(&p.props));
+            let para_value = rp.as_ref().map(|p| serde_json::to_value(p).unwrap_or(Value::Null)).unwrap_or(Value::Null);
             let lower = |v: String| v.to_lowercase();
             let underline = lower(format!("{:?}", rc.underline));
             let vert = lower(format!("{:?}", rc.vert_align));
@@ -495,6 +487,10 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeFormatState
                 "align": rp.as_ref().map(|p| lower(format!("{:?}", p.align))).unwrap_or_default(),
                 "style": rp.as_ref().map(|p| p.style.clone()).unwrap_or_default(),
                 "list": rp.as_ref().map(|p| p.numbering.is_some()).unwrap_or(false),
+                "indentLeft": para_value.get("indentLeft").cloned().unwrap_or(json!(0)),
+                "indentRight": para_value.get("indentRight").cloned().unwrap_or(json!(0)),
+                "indentFirst": para_value.get("indentFirst").cloned().unwrap_or(json!(0)),
+                "tabs": para_value.get("tabs").cloned().unwrap_or(json!([])),
             })
             .to_string()
         }
@@ -693,6 +689,135 @@ pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeSelectObjec
             }
         }
         Err(_) => json!({"ok": false, "error": "WordCraft engine session lock failed"}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Open bytes into the shared session. Returns a status line, or exactly `PASSWORD_REQUIRED` /
+/// `WRONG_PASSWORD` so the app can ask for (or re-ask for) the document's password.
+fn open_into_session(name: &str, bytes: &[u8], password: Option<&str>) -> String {
+    match wordcraft_engine::io::open_bytes_with(name, bytes, password) {
+        Ok((document, _encrypted)) => match session().lock() {
+            Ok(mut current) => {
+                current.set_document(document);
+                format!("Opened {name} with WordCraft 0.16.0")
+            }
+            Err(_) => "WordCraft engine session lock failed".to_owned(),
+        },
+        Err(error) => {
+            if wordcraft_engine::io::wrong_password(&error) {
+                "WRONG_PASSWORD".to_owned()
+            } else if wordcraft_engine::io::needs_password(&error) {
+                "PASSWORD_REQUIRED".to_owned()
+            } else {
+                format!("Could not open {name}: {error}")
+            }
+        }
+    }
+}
+
+/// Open a password-protected document with the password the user typed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeOpenDocumentWithPassword(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    name: JString<'_>,
+    bytes: JByteArray<'_>,
+    password: JString<'_>,
+) -> jstring {
+    let name = match read_string(&mut env, &name) {
+        Ok(value) => value,
+        Err(error) => return java_string(&mut env, error),
+    };
+    let password = match read_string(&mut env, &password) {
+        Ok(value) => value,
+        Err(error) => return java_string(&mut env, error),
+    };
+    let bytes = match env.convert_byte_array(bytes) {
+        Ok(value) => value,
+        Err(error) => return java_string(&mut env, format!("Could not read document bytes: {error}")),
+    };
+    let result = open_into_session(&name, &bytes, Some(&password));
+    java_string(&mut env, result)
+}
+
+// ---------------------------------------------------------------------------
+// Proofing marks, comment markers, plain text (read aloud)
+// ---------------------------------------------------------------------------
+
+/// Spelling and grammar issues as rectangles in page points with their suggestions:
+/// `{"ok":true,"marks":[{"page","x","top","w","h","kind","message","text","suggestions":[..],"start":Pos,"end":Pos}]}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeProofMarks(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    use wordcraft_engine::doc::Pos;
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let issues = current.run("review.issues", &json!({})).unwrap_or(Value::Null);
+            let layout = current.layout();
+            let mut marks: Vec<Value> = Vec::new();
+            if let Some(list) = issues.as_array() {
+                for issue in list.iter().take(400) {
+                    let start = serde_json::from_value::<Pos>(issue["start"].clone()).ok();
+                    let end = serde_json::from_value::<Pos>(issue["end"].clone()).ok();
+                    let (Some(a), Some(b)) = (start, end) else { continue };
+                    let (Some(ca), Some(cb)) = (layout.caret(&a), layout.caret(&b)) else { continue };
+                    if ca.page == cb.page && (ca.top - cb.top).abs() < 1.0 && cb.x > ca.x {
+                        let suggestions: Vec<Value> = issue["suggestions"].as_array().map(|v| v.iter().take(5).cloned().collect()).unwrap_or_default();
+                        marks.push(json!({
+                            "page": ca.page, "x": ca.x, "top": ca.top, "w": cb.x - ca.x, "h": ca.height,
+                            "kind": issue["kind"], "message": issue["message"], "text": issue["text"],
+                            "suggestions": suggestions, "start": issue["start"], "end": issue["end"],
+                        }));
+                    }
+                }
+            }
+            json!({"ok": true, "marks": marks}).to_string()
+        }
+        Err(_) => json!({"ok": false}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// Where each comment is anchored: `{"ok":true,"marks":[{"id","page","top","h","resolved"}]}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeCommentMarks(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    use wordcraft_engine::doc::Pos;
+    let text = match session().lock() {
+        Ok(mut current) => {
+            let comments = current.run("review.comments", &json!({})).unwrap_or(Value::Null);
+            let layout = current.layout();
+            let mut marks: Vec<Value> = Vec::new();
+            if let Some(list) = comments.as_array() {
+                for c in list.iter().filter(|c| c["parent"].is_null()).take(200) {
+                    if let Some(anchor) = serde_json::from_value::<Pos>(c["anchor"].clone()).ok() {
+                        if let Some(cr) = layout.caret(&anchor) {
+                            marks.push(json!({"id": c["id"], "page": cr.page, "top": cr.top, "h": cr.height, "resolved": c["resolved"]}));
+                        }
+                    }
+                }
+            }
+            json!({"ok": true, "marks": marks}).to_string()
+        }
+        Err(_) => json!({"ok": false}).to_string(),
+    };
+    java_string(&mut env, text)
+}
+
+/// The body's plain text, for Read Aloud.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_wordcraft_android_NativeBridge_nativeDocumentText(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let text = match session().lock() {
+        Ok(current) => current.doc.plain_text(wordcraft_engine::doc::StoryRef::Body),
+        Err(_) => String::new(),
     };
     java_string(&mut env, text)
 }
@@ -940,5 +1065,78 @@ mod tests {
             let r = s.run("arrange.wrap", &json!({"value": v}));
             eprintln!("wrap {v}: {:?}", r.map(|_| ()).map_err(|e| e.to_string()));
         }
+    }
+
+    #[test]
+    fn proofing_ink_caret_and_password_paths() {
+        use wordcraft_engine::doc::Pos;
+        let mut s = Session::new(Document::new());
+        s.run("text.insert", &json!({"text": "teh quick brown fox"})).unwrap();
+        // Spelling marks become rectangles on the page.
+        let issues = s.run("review.issues", &json!({})).unwrap();
+        let first = &issues.as_array().unwrap()[0];
+        let a: Pos = serde_json::from_value(first["start"].clone()).unwrap();
+        let b: Pos = serde_json::from_value(first["end"].clone()).unwrap();
+        let layout = s.layout();
+        let (ca, cb) = (layout.caret(&a).unwrap(), layout.caret(&b).unwrap());
+        assert!(cb.x > ca.x && ca.page == cb.page);
+        // Fixing a word: select it and type the suggestion.
+        s.run("select.range", &json!({"anchor": first["start"], "focus": first["end"]})).unwrap();
+        s.run("text.insert", &json!({"text": "the"})).unwrap();
+        assert!(s.doc.plain_text(wordcraft_engine::doc::StoryRef::Body).starts_with("the quick"));
+        // Ink strokes land in the document and show on the page.
+        let before = {
+            let l = s.layout();
+            wordcraft_engine::render::render_page(&s.doc, &l.pages[0], 1.0, &page_render_options(&s)).pixels
+        };
+        let pts: Vec<Value> = (0..40).map(|i| json!([100.0 + i as f32 * 4.0, 300.0 + (i as f32 * 0.4).sin() * 20.0])).collect();
+        s.run("draw.stroke", &json!({"page": 0, "points": pts, "tool": "pen", "color": "C00000", "width": 3})).unwrap();
+        let after = {
+            let l = s.layout();
+            wordcraft_engine::render::render_page(&s.doc, &l.pages[0], 1.0, &page_render_options(&s)).pixels
+        };
+        assert_ne!(before, after, "ink must be drawn on the page");
+        // Hardware-keyboard caret movement with selection.
+        let r = s.run("caret.left", &json!({"extend": true}));
+        eprintln!("caret.left extend: {:?}", r.map(|_| ()).map_err(|e| e.to_string()));
+        s.run("caret.wordRight", &json!({})).unwrap();
+        s.run("caret.home", &json!({})).unwrap();
+        s.run("select.paragraph", &json!({})).unwrap();
+        assert!(!s.sel.is_collapsed());
+        // Header editing, themes list, comments.
+        s.run("insert.editHeader", &json!({"page": 0})).unwrap();
+        s.run("insert.closeHeader", &json!({})).unwrap();
+        let themes = s.run("design.themes", &json!({})).unwrap();
+        eprintln!("THEMES {}", themes.to_string().chars().take(300).collect::<String>());
+        s.run("para.indents", &json!({"left": 36.0, "firstLine": -18.0})).unwrap();
+        s.run("para.tabs", &json!({"set": [{"pos": 144.0, "align": "left"}]})).unwrap();
+        // Password-aware open reports clean markers for a plain file (no password needed).
+        let msg = open_into_session("note.txt", b"Hello", None);
+        assert!(msg.starts_with("Opened"), "{msg}");
+    }
+
+    #[test]
+    fn review_flow_probe() {
+        let mut s = Session::new(Document::new());
+        s.run("text.insert", &json!({"text": "alpha beta"})).unwrap();
+        s.run("review.trackChanges", &json!({})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": "gamma"})).unwrap();
+        let ch = s.run("review.changes", &json!({})).unwrap();
+        let n0 = ch.as_array().unwrap().len();
+        let first = &ch.as_array().unwrap()[0];
+        s.run("select.range", &json!({"anchor": first["start"], "focus": first["end"]})).unwrap();
+        s.run("review.accept", &json!({"next": false})).unwrap();
+        let n1 = s.run("review.changes", &json!({})).unwrap().as_array().unwrap().len();
+        eprintln!("\nREVIEW changes {n0} -> {n1}"); assert!(n1 < n0, "accept should resolve one change");
+        s.run("review.trackChanges", &json!({})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        let story_before = format!("{:?}", s.sel.focus.story);
+        s.run("review.newComment", &json!({"text": "Look"})).unwrap();
+        eprintln!("REVIEW story before {story_before} after {:?}", s.sel.focus.story);
+        let r = s.run("insert.editFooter", &json!({"page": 0}));
+        eprintln!("REVIEW editFooter {:?}", r.map(|_| ()).map_err(|e| e.to_string()));
+        s.run("insert.closeHeader", &json!({})).unwrap();
+        eprintln!("REVIEW story after close {:?}", s.sel.focus.story);
     }
 }

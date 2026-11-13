@@ -144,14 +144,12 @@ fun WordTitleBar(
     autoSave: Boolean,
     canUndo: Boolean,
     canRedo: Boolean,
-    focusMode: Boolean,
+    menuItems: List<Pair<String, String>>,
     onHome: () -> Unit,
     onSave: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onSearch: () -> Unit,
-    onToggleAutoSave: () -> Unit,
-    onToggleFocus: () -> Unit,
     onMenuItem: (String) -> Unit
 ) {
     var menu by remember { mutableStateOf(false) }
@@ -182,18 +180,9 @@ fun WordTitleBar(
         Box {
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "More") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                listOf("New" to "file.new", "Open…" to "file.open", "Save as DOCX…" to "file.saveAs",
-                    "Export PDF…" to "file.exportPdf", "Share…" to "file.share", "Fit page to screen" to "view.pageWidth").forEach { (label, id) ->
+                menuItems.forEach { (label, id) ->
                     DropdownMenuItem(text = { Text(label) }, onClick = { menu = false; onMenuItem(id) })
                 }
-                DropdownMenuItem(
-                    text = { Text("AutoSave: ${if (autoSave) "On" else "Off"}") },
-                    onClick = { menu = false; onToggleAutoSave() }
-                )
-                DropdownMenuItem(
-                    text = { Text(if (focusMode) "Exit focus mode" else "Focus mode") },
-                    onClick = { menu = false; onToggleFocus() }
-                )
             }
         }
     }
